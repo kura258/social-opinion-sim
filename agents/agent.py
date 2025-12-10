@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional
 import random
 import numpy as np
 
+from config.styles import STYLE_GUIDE
 from .memory import MemoryStream
 
 
@@ -13,10 +14,10 @@ class Agent:
     """
     多智能体舆论模拟中的单个 Agent。
     特点：
-    - 拥有角色类型（brand_official / angry_user / neutral_user / fan_user / media 等）
-    - 拥有人物设定 profile（背景、性格）
+    - 角色类型支持 BrandOfficial / KOL / Troll / Defender / Crowd（上层传入的 role 决定 driver_mode）
+    - 拥有人物设定 profile（背景、性格）与心理动力学参数
     - 拥有 MemoryStream（记忆系统）
-    - 能根据看到的帖子在社交媒体上决定：post / retweet / silent
+    - 能根据看到的帖子在社交媒体上决定：post / retweet / silent，并支持 reflex/brain 双驱动
     """
 
     def __init__(
@@ -30,7 +31,7 @@ class Agent:
     ):
         """
         :param name: Agent 名字（如 "BrandOfficial", "AngryUser1"）
-        :param role: 角色类型（如 "brand_official", "angry_user"）
+        :param role: 角色类型（如 "BrandOfficial"/"KOL"/"Troll"/"Defender"/"Crowd"，用于确定 driver_mode）
         :param profile: 角色设定描述（自然语言）
         :param llm_client: 封装好的 LLMClient，拥有 chat / chat_thinking 方法
         :param topics: 关注的话题列表
@@ -44,6 +45,19 @@ class Agent:
         self.attention_weights = self._init_attention_weights(attention_weights)
         self.history: List[str] = []
         self.memory = MemoryStream(llm_client=llm_client)
+        self.driver_mode = "brain" if self.role in ("BrandOfficial", "KOL", "Troll") else "reflex"
+        self.psychology = {
+            "conformity": np.random.beta(2, 5),
+            "susceptibility": np.random.beta(2, 2),
+            "ideology": np.random.random(),
+            "risk_tolerance": 0.1 if self.role == "BrandOfficial" else np.random.beta(2, 5),
+            "current_anger": 0.0,
+        }
+        self.trust_matrix = {
+            "official": 0.9 if self.role == "BrandOfficial" else 0.6,
+            "kol": 0.7,
+            "rumor": 0.5,
+        }
 
     def _init_attention_weights(
         self, provided_weights: Optional[Dict[str, float]]
@@ -112,21 +126,19 @@ class Agent:
         if soc.sum() > 0:
             soc = soc / soc.sum()
 
-        # 热度：来自 topic_manager
-        heat = np.zeros(len(self.topics), dtype=float)
+        # 热度：来自 topic_manager，使用 Sigmoid 放大小幅差异
+        heat_score = np.zeros(len(self.topics), dtype=float)
         if environment is not None and getattr(environment, "topic_manager", None):
             tm = environment.topic_manager
-            heat = np.array([tm.get_heat(t) for t in self.topics], dtype=float)
-            if heat.sum() > 0:
-                heat = heat / heat.sum()
+            raw_heats = np.array([tm.get_heat(t) for t in self.topics], dtype=float)
+            heat_score = 1 / (1 + np.exp(-(raw_heats - 1000.0) / 500.0))
 
         # 随机噪声，防止概率塌缩
         noise = np.random.random(len(self.topics))
         noise = noise / noise.sum()
 
-        # 效用函数 U = w1*interest + w2*soc + w3*log(heat+1) + w4*noise
-        log_heat = np.log(heat + 1e-6)  # 避免 log(0)
-        utility = 0.5 * interest + 0.2 * soc + 0.2 * log_heat + 0.1 * noise
+        # 效用函数提升热度与社交权重，体现跟风
+        utility = 0.2 * interest + 0.3 * soc + 0.4 * heat_score + 0.1 * noise
 
         # Softmax with temperature
         scores = utility / max(temperature, 1e-6)
@@ -170,6 +182,8 @@ class Agent:
         t: int,
         observed_posts: List[Dict[str, Any]],
         forced_topic: Optional[str] = None,
+        environment=None,
+        env_context=None,
     ) -> str:
         """
         构造让 Agent 在社交媒体上决策的 prompt。
@@ -190,6 +204,14 @@ class Agent:
             f"- 来自 {p['author']}：{p['summary']}（情绪：{p['sentiment']}，标签：{p['tag']}）"
             for p in observed_posts
         ) or "（此时间步你没有看到任何新帖子）"
+        global_tension = 0.0
+        if env_context:
+            global_tension = float(env_context.get("global_tension", 0.0) or 0.0)
+        elif environment is not None and hasattr(environment, "current_intensity"):
+            # 回退：用 intensity 估算紧张度
+            global_tension = float(np.tanh(getattr(environment, "current_intensity", 0.0) / 100.0))
+        tension_level = "极高" if global_tension > 0.8 else ("高" if global_tension > 0.5 else ("中" if global_tension > 0.2 else "低"))
+        current_phase = getattr(environment, "phase", None) or (env_context.get("phase") if env_context else "Unknown")
 
         prompt = f"""
 你的名字：{self.name}
@@ -202,6 +224,10 @@ class Agent:
 
 现在是时间步 {t}，你在社交媒体上看到了这些新帖子（来自你关注的人）：
 {posts_str}
+
+【当前环境局势】
+舆情阶段：{current_phase}（Incubation=潜伏，Fermentation=发酵/爆发，Climax=高潮）
+全网紧张程度：{tension_level}（0-1={global_tension:.2f}）
 
 你需要根据自己的角色和立场，决定是否发声，并选择要聚焦的话题。请注意：
 1. 只使用简体中文表达。
@@ -227,6 +253,7 @@ class Agent:
         t: int,
         observed_posts: List[Dict[str, Any]],
         environment=None,
+        env_context=None,
     ) -> Dict[str, Any]:
         """
         根据当前时间步 t 和能看到的帖子列表，返回一个动作：
@@ -239,31 +266,50 @@ class Agent:
         }
         """
         role_prompts = {
-            "official_media": (
+            "BrandOfficial": (
                 "你是权威媒体/官方账号，语气正式客观，强调核实、等待通报，不信谣不传谣。"
             ),
-            "kol": (
+            "KOL": (
                 "你是微博意见领袖/营销号，带节奏、善用反问和悬念，语气接地气，情绪化以求流量。"
             ),
-            "troll": (
+            "Troll": (
                 "你是极端情绪用户/杠精，发言尖锐、嘲讽、攻击或阴阳怪气，擅长挑衅。"
             ),
-            "defender": (
+            "Defender": (
                 "你是死忠粉/护卫队，极度护短，控评、呼吁理性，反击黑子，充满爱意或防御性。"
             ),
-            "crowd": (
+            "Crowd": (
                 "你是吃瓜群众，超短评、跟风、好奇打卡，立场摇摆，偶尔只@好友或发表情。"
             ),
         }
         role_hint = role_prompts.get(self.role, "你是一个普通用户，保持简洁、多样化表达，避免复读。")
+        style = STYLE_GUIDE.get(self.role, STYLE_GUIDE.get("Crowd", {}))
+        role_description = style.get("description", "普通用户")
+        keywords = ", ".join(style.get("keywords", []))
+        sentence_patterns = " | ".join(style.get("sentence_patterns", []))
+        tone_instruction = style.get("tone_instruction", "")
+        style_block = (
+            "【语言风格要求】\n"
+            f"你现在的身份是微博上的【{role_description}】。请严格遵守以下说话方式：\n"
+            f"1. 必须包含关键词（选2-3个）: {keywords}\n"
+            f"2. 推荐句式参考: {sentence_patterns}\n"
+            f"3. 语气指令: {tone_instruction}"
+        )
         system = (
             f"{role_hint}"
             " 你需要根据记忆和看到的帖子，决定是否发声。"
             " 严格输出 JSON，不要输出多余文字。"
             " 所有内容必须使用简体中文。"
         )
+        system = f"{system}\n{style_block}"
         forced_topic = self.select_topic(environment=environment)
-        user = self._build_social_prompt(t, observed_posts, forced_topic=forced_topic)
+        user = self._build_social_prompt(
+            t,
+            observed_posts,
+            forced_topic=forced_topic,
+            environment=environment,
+            env_context=env_context,
+        )
 
         resp = self.llm.chat(system, user)
 
@@ -301,4 +347,165 @@ class Agent:
         if not action.get("topic"):
             action["topic"] = forced_topic
 
+        # 若模型选择沉默但环境紧张，启用启发式兜底避免全局无声
+        fallback_tension = (env_context or {}).get("global_tension", 0.0) if env_context else 0.0
+        if action.get("action") == "silent" and fallback_tension > 0.05:
+            if observed_posts:
+                target_id = observed_posts[-1].get("id")
+                action = {
+                    "action": "retweet",
+                    "post_text": "",
+                    "sentiment": "NEUTRAL",
+                    "target_post_id": target_id if isinstance(target_id, int) else None,
+                    "topic": action.get("topic") or forced_topic,
+                }
+            else:
+                action = {
+                    "action": "post",
+                    "post_text": "围观一下，大家怎么看？",
+                    "sentiment": "NEUTRAL",
+                    "target_post_id": None,
+                    "topic": action.get("topic") or forced_topic,
+                }
+
         return action
+
+    def _calculate_reflex_action(self, post, env_context):
+        """
+        反射型智能体基于概率的快速决策：返回 ("REPOST"/"SILENCE", mode)。
+        """
+        context = env_context or {}
+        global_tension = context.get("global_tension", 0.0)
+
+        base_desire = self.psychology.get("susceptibility", 0.5)
+        env_pressure = global_tension * 2.0  # Hawkes intensity 转化的环境压强
+        heat = getattr(post, "heat", 0.0) or 0.0
+        social_boost = self.psychology.get("conformity", 0.0) * (heat / (heat + 1000.0))
+        trust_factor = self.trust_matrix.get(getattr(post, "author_role", None), 0.5)
+
+        risk_penalty = 0.0
+        verified = getattr(post, "is_verified", False)
+        low_risk_tolerance = self.psychology.get("risk_tolerance", 0.0) < 0.3
+        too_angry = self.psychology.get("current_anger", 0.0) > 0.7
+        if not verified and low_risk_tolerance and not too_angry:
+            risk_penalty = 1.0
+
+        logit = -2.0 + (base_desire * 2.0) + (env_pressure * 3.0) + (social_boost * 2.0)
+        logit = logit * trust_factor - risk_penalty
+        prob_repost = 1 / (1 + np.exp(-logit))
+
+        dice = np.random.random()
+        if dice < prob_repost:
+            return ("REPOST", "forward_only")
+        return ("SILENCE", None)
+
+    def _call_llm_decision(self, post, env_context=None):
+        """
+        深度（brain）模式的决策，封装 LLM 调用；默认无法生成时保持沉默。
+        """
+        if not hasattr(self.llm, "chat"):
+            return ("SILENCE", None)
+
+        context = env_context or {}
+        global_tension = context.get("global_tension", 0.5)
+        author_role = getattr(post, "author_role", "unknown")
+        content = getattr(post, "text", "") or getattr(post, "content", "")
+        verified = getattr(post, "is_verified", False)
+        heat = getattr(post, "heat", 0.0)
+
+        system = (
+            f"你是 {self.name}（角色：{self.role}），需要深思熟虑地决定是否转发或沉默。"
+            " 只输出 REPOST 或 SILENCE。"
+        )
+        user = (
+            f"帖子作者角色: {author_role}\n"
+            f"热度: {heat}\n"
+            f"是否已证实: {verified}\n"
+            f"全局紧张度: {global_tension}\n"
+            f"帖子内容: {content}"
+        )
+        try:
+            resp = self.llm.chat(system, user)
+            normalized = str(resp).strip().upper()
+            if normalized.startswith("REPOST"):
+                return ("REPOST", "llm_brain")
+        except Exception:
+            pass
+        return ("SILENCE", None)
+
+    def decide_action(self, post, env_context=None):
+        """
+        混合驱动决策入口：reflex 模式走概率，brain 模式走 LLM。
+        """
+        if self.driver_mode == "reflex":
+            return self._calculate_reflex_action(post, env_context)
+        return self._call_llm_decision(post, env_context)
+
+    # ------------------------------------------------------------------
+    # 强制发声模式（阵营代表）
+    # ------------------------------------------------------------------
+    def force_action(self, env_context: dict, observed_posts: list) -> Dict[str, Any]:
+        """
+        阵营代表强制发声模式：无需个体意愿，直接按配额执行。
+        """
+        topic = self._choose_topic_under_pressure(env_context)
+        if self.driver_mode == "brain":
+            return self._decide_by_llm_force(topic, env_context, observed_posts)
+        return self._decide_by_reflex_force(topic, env_context, observed_posts)
+
+    def _choose_topic_under_pressure(self, env_context: dict) -> str:
+        topic_heats = env_context.get("topic_heats", {}) if env_context else {}
+        if not topic_heats:
+            return self.topics[0] if self.topics else "General"
+        topics = list(topic_heats.keys())
+        heats = np.array([topic_heats[t] for t in topics], dtype=float)
+        if np.random.random() < 0.8:
+            return topics[int(np.argmax(heats))]
+        return np.random.choice(topics)
+
+    def _decide_by_reflex_force(self, topic, env_context, observed_posts):
+        related_posts = [p for p in observed_posts if p.get("topic") == topic]
+        action_type = "post"
+        target_id = None
+        if self.role == "Crowd":
+            if related_posts and np.random.random() < 0.7:
+                action_type = "retweet"
+                target = np.random.choice(related_posts)
+                target_id = target.get("id")
+        elif self.role == "KOL":
+            action_type = "post"
+        return {
+            "action": action_type,
+            "topic": topic,
+            "target_post_id": target_id,
+            "post_text": f"【{self.role}发声】关注话题 #{topic}#",
+            "sentiment": "NEUTRAL",
+            "tag": "user",
+        }
+
+    def _decide_by_llm_force(self, topic, env_context, observed_posts):
+        system = (
+            f"你是 {self.name} ({self.role})。现在全网都在讨论【{topic}】。"
+            "请你必须生成一条微博，输出合法 JSON："
+            '{"action": "post"或"retweet", "post_text": "..."}'
+        )
+        user = ""
+        try:
+            resp = self.llm.chat(system, user)
+            import json
+
+            parsed = json.loads(resp)
+            if parsed.get("action") in ["post", "retweet"]:
+                parsed.setdefault("post_text", f"大家怎么看 #{topic}#")
+                parsed.setdefault("topic", topic)
+                parsed.setdefault("sentiment", "NEUTRAL")
+                return parsed
+        except Exception:
+            pass
+        return {
+            "action": "post",
+            "topic": topic,
+            "post_text": f"大家怎么看 #{topic}#",
+            "sentiment": "NEUTRAL",
+            "tag": "user",
+        }

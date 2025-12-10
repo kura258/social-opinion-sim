@@ -7,6 +7,7 @@ import time
 import random
 
 import networkx as nx
+import numpy as np
 
 
 @dataclass
@@ -75,9 +76,16 @@ class TopicManager:
         hawkes = self.H_base + self.mu_fast * tdata["mem_fast"] + self.mu_slow * tdata["mem_slow"]
         return (base + hawkes) * self.heat_scale
 
-    def add_post(self, topic: str, post_content: str, current_time: int = 0, reach: float = 0.0) -> None:
+    def add_post(
+        self,
+        topic: str,
+        post_content: str,
+        current_time: int = 0,
+        reach: float = 0.0,
+        count: float = 1.0,
+    ) -> None:
         """
-        记录新增帖子并刷新热度；reach 表示影响范围，可简单累加。
+        记录新增帖子并刷新热度；reach 表示影响范围，可简单累加；count 表示该帖代表的事件权重。
         """
         if topic not in self.topics:
             return
@@ -85,15 +93,15 @@ class TopicManager:
         tdata["posts"].append(post_content)
         tdata["events"].append(current_time)
         step_stats = tdata["per_step"].setdefault(current_time, {"V": 0, "C": 0, "R": 0})
-        step_stats["V"] += 1
-        step_stats["R"] += reach
+        step_stats["V"] += count
+        step_stats["R"] += reach * count
         # 双衰减记忆更新
         last_time = tdata["last_time"]
         dt = (current_time - last_time) if last_time is not None else 0
         decay_fast = math.exp(-self.lambda_fast * dt) if dt > 0 else 1.0
         decay_slow = math.exp(-self.lambda_slow * dt) if dt > 0 else 1.0
-        tdata["mem_fast"] = tdata["mem_fast"] * decay_fast + 1.0
-        tdata["mem_slow"] = tdata["mem_slow"] * decay_slow + 1.0
+        tdata["mem_fast"] = tdata["mem_fast"] * decay_fast + float(count)
+        tdata["mem_slow"] = tdata["mem_slow"] * decay_slow + float(count)
         tdata["last_time"] = current_time
 
         tdata["heat"] = self._compute_heat(topic, current_time)
@@ -109,7 +117,8 @@ class SocialEnv:
     - G：关注关系图
     - agents：name -> Agent
     - posts：历史帖子列表
-    - topic_manager：记录各话题热度
+    - topic_manager：记录各话题热度并驱动双衰减 Hawkes 记忆
+    - 每步计算 lifecycle phase / global_tension，并注入 env_context 影响 Agent 决策
     """
 
     def __init__(
@@ -130,6 +139,30 @@ class SocialEnv:
             TopicManager(self._topics, hawkes_params) if self._topics else None
         )
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
+        self._last_step_volume: float = 0.0
+        hp = hawkes_params or {}
+        self.params = {
+            "mu_fast": hp.get("mu_fast", 0.5),
+            "mu_slow": hp.get("mu_slow", 0.2),
+            "H_base": hp.get("H_base", 0.0),
+            "lambda_fast": hp.get("lambda_fast", 1.0),
+            "lambda_slow": hp.get("lambda_slow", 0.3),
+        }
+        self.M_fast = 0.0
+        self.M_slow = 0.0
+        self.current_intensity = 0.0
+        self.phase = "Incubation"
+        self.official_has_spoken = False
+        # Hawkes -> 现实发声量的物理映射倍率
+        self.intensity_scale = 1.0
+        # 5 大角色声量占比
+        self.role_distribution = {
+            "Crowd": 0.85,
+            "Defender": 0.08,
+            "Troll": 0.04,
+            "KOL": 0.02,
+            "BrandOfficial": 0.01,
+        }
 
     def reset(self):
         self.posts = []
@@ -138,6 +171,12 @@ class SocialEnv:
         if self._topics:
             self.topic_manager = TopicManager(self._topics, self._hawkes_params)
         self._agent_last_action = {name: 0 for name in self.agents}
+        self._last_step_volume = 0.0
+        self.M_fast = 0.0
+        self.M_slow = 0.0
+        self.current_intensity = 0.0
+        self.phase = "Incubation"
+        self.official_has_spoken = False
 
     def _compute_reach(self, author: str) -> int:
         """简单地以关注入度作为传播影响力近似。"""
@@ -145,6 +184,38 @@ class SocialEnv:
             return int(self.G.in_degree(author))
         except Exception:
             return 0
+
+    def _update_hawkes_state(self, new_posts_count: int) -> None:
+        """
+        使用双衰减核递推更新 Hawkes 状态，无需回溯历史。
+        """
+        self.M_fast = self.M_fast * np.exp(-self.params["lambda_fast"]) + new_posts_count
+        self.M_slow = self.M_slow * np.exp(-self.params["lambda_slow"]) + new_posts_count
+        intensity = (
+            self.params["H_base"]
+            + self.params["mu_fast"] * self.M_fast
+            + self.params["mu_slow"] * self.M_slow
+        )
+        self.current_intensity = intensity
+
+    def _determine_phase(self, total_heat: float) -> str:
+        """
+        根据热度与官方发声情况判定生命周期阶段。
+        """
+        # 官方在上一轮是否发声
+        recent_official = [
+            p for p in self.posts if p.time_step == self.t - 1 and p.author == "BrandOfficial"
+        ]
+        if recent_official:
+            self.official_has_spoken = True
+
+        if self.official_has_spoken:
+            return "Climax"
+        if total_heat > 2000:
+            return "Fermentation"
+        if total_heat > 500:
+            return "Diffusion"
+        return "Incubation"
 
     def _add_post(
         self,
@@ -154,6 +225,7 @@ class SocialEnv:
         tag: str,
         target_post_id: Optional[int] = None,
         topic: Optional[str] = None,
+        count: float = 1.0,
     ):
         post = Post(
             id=self._next_post_id,
@@ -170,10 +242,10 @@ class SocialEnv:
 
         if self.topic_manager and topic:
             reach = self._compute_reach(author)
-            self.topic_manager.add_post(topic, text, current_time=self.t, reach=reach)
+            self.topic_manager.add_post(topic, text, current_time=self.t, reach=reach, count=count)
 
-    def step(self, pr_strategy=None, request_delay: float = 0.0):
-        """推进一个时间步，按权重驱动 Agent 发声。"""
+    def step_legacy(self, pr_strategy=None, request_delay: float = 0.0):
+        """（保留旧版）推进一个时间步：更新热度/强度/phase，构造 env_context，再按权重驱动 Agent 发声。"""
         self.t += 1
         new_posts: List[Post] = []
         observed = [
@@ -189,6 +261,22 @@ class SocialEnv:
             for p in self.posts
             if p.time_step == self.t - 1
         ]
+        posts_last_step = [p for p in self.posts if p.time_step == self.t - 1]
+
+        # ---- 预计算环境信号 ----
+        total_heat = 0.0
+        if self.topic_manager and self._topics:
+            total_heat = sum(self.topic_manager.get_heat(tp) for tp in self._topics)
+        self.phase = self._determine_phase(total_heat)
+        self._update_hawkes_state(len(posts_last_step))
+        global_tension = float(np.tanh(self.current_intensity / 100.0))
+
+        # ---- 环境上下文传递给 Agent ----
+        env_context = {
+            "phase": self.phase,
+            "global_tension": global_tension,
+            "is_official_intervened": self.official_has_spoken,
+        }
 
         # ---- 基于 Hawkes 参数 + 角色画像的权重调度 ----
         mu_fast = self._hawkes_params.get("mu_fast", 0.5) if self._hawkes_params else 0.5
@@ -196,13 +284,13 @@ class SocialEnv:
         lambda_fast = self._hawkes_params.get("lambda_fast", 1.0) if self._hawkes_params else 1.0
         lambda_slow = self._hawkes_params.get("lambda_slow", 0.3) if self._hawkes_params else 0.3
         base_map = {
-            "official_media": 0.35 * mu_slow,
-            "kol": 0.30 * mu_fast,
-            "troll": 0.15 * mu_fast,
-            "defender": 0.10 * mu_fast,
-            "crowd": 0.35 * mu_slow,
+            "BrandOfficial": 0.35 * mu_slow,
+            "KOL": 0.30 * mu_fast,
+            "Troll": 0.15 * mu_fast,
+            "Defender": 0.10 * mu_fast,
+            "Crowd": 0.35 * mu_slow,
         }
-        fast_roles = {"kol", "troll", "defender"}
+        fast_roles = {"KOL", "Troll", "Defender"}
         alpha_heat = 0.12  # 热度对出场概率的放大系数（更温和）
 
         weights = []
@@ -231,7 +319,14 @@ class SocialEnv:
         if weights and sum(weights) > 0:
             total_w = sum(weights)
             norm_w = [w / total_w for w in weights]
-            target_k = max(1, int(len(names) * 0.4))  # 每步约 40% 参与，降低爆发
+            # 使用 Hawkes intensity 动态控制参与人数，爆发期更多 Agent 入场
+            max_intensity_ref = 100.0  # 依据训练热度量级设置的基准值
+            intensity_ratio = 0.0
+            if max_intensity_ref > 0:
+                intensity_ratio = min(max(self.current_intensity / max_intensity_ref, 0.0), 1.0)
+            base_activity = 0.2  # 潜伏期保证更高基线出场率
+            dynamic_activity = base_activity + 0.8 * intensity_ratio  # 最高可达约 100%
+            target_k = max(2, int(len(names) * dynamic_activity))
             pool = list(zip(names, norm_w))
             while pool and len(active_agents) < target_k:
                 cand = random.choices(pool, weights=[w for _, w in pool], k=1)[0][0]
@@ -245,10 +340,48 @@ class SocialEnv:
             if request_delay > 0:
                 time.sleep(request_delay)
 
+            # 用环境信号驱动 agent 的混合决策
+            signal_post = type("EnvSignal", (), {})()
+            setattr(signal_post, "heat", total_heat)
+            # æœªæœ‰å…¬å¼€å†³å®šçš„æ–‡æ¡£æ—¶ï¼Œé»˜è®¤ä»¥æ™®é€šç”¨æˆ·èº«ä»½è§†ä¸ºä¿¡æ¯æ¥æºï¼Œä¸è®¾ä¸º rumor
+            setattr(signal_post, "author_role", "official" if self.official_has_spoken else "user")
+            setattr(signal_post, "is_verified", self.official_has_spoken)
+            if hasattr(agent, "driver_mode") and hasattr(agent, "decide_action"):
+                try:
+                    decision = agent.decide_action(signal_post, env_context)
+                except Exception:
+                    decision = None
+            else:
+                decision = None
+
             if pr_strategy and name == "BrandOfficial":
                 action = pr_strategy.decide_brand_action(self.t, agent, observed)
             else:
-                action = agent.decide_social_action(self.t, observed, environment=self)
+                if decision and isinstance(decision, tuple):
+                    if decision[0] == "SILENCE":
+                        # Reflex 模式直接沉默；Brain 模式继续走完整社交决策
+                        if getattr(agent, "driver_mode", "") == "reflex":
+                            continue
+                        action = agent.decide_social_action(
+                            self.t, observed, environment=self, env_context=env_context
+                        )
+                    if decision[0] == "REPOST":
+                        # Reflex 模式快速转发
+                        action = {
+                            "action": "retweet",
+                            "post_text": "",
+                            "sentiment": "NEUTRAL",
+                            "target_post_id": None,
+                            "topic": None,
+                        }
+                    else:
+                        action = agent.decide_social_action(
+                            self.t, observed, environment=self, env_context=env_context
+                        )
+                else:
+                    action = agent.decide_social_action(
+                        self.t, observed, environment=self, env_context=env_context
+                    )
 
             if action is None:
                 continue
@@ -278,4 +411,90 @@ class SocialEnv:
                 new_posts.append(self.posts[-1])
             else:
                 continue
+        return new_posts
+
+    def step(self, pr_strategy=None, request_delay: float = 0.0):
+        """
+        基于 5 Agent 的变权调度：Hawkes 强度 -> 总量 -> 角色配额 -> 强制动作。
+        """
+        self.t += 1
+        new_posts: List[Post] = []
+
+        # --- Phase 1: 宏观反馈 ---
+        if not hasattr(self, "_last_step_volume"):
+            self._last_step_volume = 0.0
+        self._update_hawkes_state(self._last_step_volume)
+
+        # --- Phase 2: 计算本轮总产量 ---
+        current_intensity = max(0.0, self.current_intensity)
+        total_virtual_events = 0.5 + (current_intensity * self.intensity_scale)
+
+        # --- Phase 3: 构造上下文 ---
+        total_heat = 0.0
+        topic_heats = {}
+        if self.topic_manager and self._topics:
+            topic_heats = {tp: self.topic_manager.get_heat(tp) for tp in self._topics}
+            total_heat = sum(topic_heats.values())
+        self.phase = self._determine_phase(total_heat)
+        env_context = {
+            "time": self.t,
+            "global_tension": min(current_intensity / 100.0, 1.0),
+            "topic_heats": topic_heats,
+            "phase": self.phase,
+        }
+
+        posts_last_step = [p for p in self.posts if p.time_step == self.t - 1]
+        observed = [
+            {"id": p.id, "author": p.author, "text": p.text, "tag": p.tag, "topic": p.topic}
+            for p in posts_last_step
+        ]
+
+        # --- Phase 4: 按配额强制动作 ---
+        current_step_real_volume = 0.0
+        for name, agent in self.agents.items():
+            role = getattr(agent, "role", "Crowd")
+            ratio = self.role_distribution.get(role, 0.05)
+            my_quota = total_virtual_events * ratio
+
+            should_act = False
+            act_weight = 0.0
+            if my_quota >= 1.0:
+                should_act = True
+                act_weight = my_quota
+            elif my_quota > 0.001 and np.random.random() < my_quota:
+                should_act = True
+                act_weight = 1.0
+
+            if not should_act:
+                continue
+
+            action = None
+            if hasattr(agent, "force_action"):
+                try:
+                    action = agent.force_action(env_context, observed)
+                except Exception:
+                    action = None
+
+            if action and action.get("action") in ["post", "retweet"]:
+                act_type = action.get("action")
+                sentiment = action.get("sentiment", "NEUTRAL")
+                tag = action.get("tag", "user" if act_type == "post" else "retweet")
+                post_text = action.get("post_text", action.get("text", ""))
+                target_id = action.get("target_post_id")
+                topic = action.get("topic")
+
+                self._add_post(
+                    author=name,
+                    text=post_text,
+                    sentiment=sentiment,
+                    tag=tag,
+                    target_post_id=target_id,
+                    topic=topic,
+                    count=act_weight,
+                )
+                self._agent_last_action[name] = self.t
+                new_posts.append(self.posts[-1])
+                current_step_real_volume += act_weight
+
+        self._last_step_volume = current_step_real_volume
         return new_posts

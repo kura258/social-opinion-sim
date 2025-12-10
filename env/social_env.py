@@ -86,6 +86,7 @@ class TopicManager:
     ) -> None:
         """
         记录新增帖子并刷新热度；reach 表示影响范围，可简单累加；count 表示该帖代表的事件权重。
+        Hawkes 记忆项使用归一化计数，防止数值爆炸。
         """
         if topic not in self.topics:
             return
@@ -95,13 +96,14 @@ class TopicManager:
         step_stats = tdata["per_step"].setdefault(current_time, {"V": 0, "C": 0, "R": 0})
         step_stats["V"] += count
         step_stats["R"] += reach * count
-        # 双衰减记忆更新
+        # 双衰减记忆更新（使用归一化 count）
+        norm_count = count / max(self.heat_scale, 1.0)
         last_time = tdata["last_time"]
         dt = (current_time - last_time) if last_time is not None else 0
         decay_fast = math.exp(-self.lambda_fast * dt) if dt > 0 else 1.0
         decay_slow = math.exp(-self.lambda_slow * dt) if dt > 0 else 1.0
-        tdata["mem_fast"] = tdata["mem_fast"] * decay_fast + float(count)
-        tdata["mem_slow"] = tdata["mem_slow"] * decay_slow + float(count)
+        tdata["mem_fast"] = tdata["mem_fast"] * decay_fast + float(norm_count)
+        tdata["mem_slow"] = tdata["mem_slow"] * decay_slow + float(norm_count)
         tdata["last_time"] = current_time
 
         tdata["heat"] = self._compute_heat(topic, current_time)
@@ -135,11 +137,19 @@ class SocialEnv:
         self._next_post_id = 1
         self._topics = list(topics) if topics else []
         self._hawkes_params = hawkes_params
+        # 数据归一化尺度，需与训练时的 heat_scale 对齐
+        self.data_scale = 1.0
+        if hawkes_params and "heat_scale" in hawkes_params:
+            self.data_scale = hawkes_params["heat_scale"]
         self.topic_manager: Optional[TopicManager] = (
             TopicManager(self._topics, hawkes_params) if self._topics else None
         )
+        # 如未显式传入，则回退使用 TopicManager 的 heat_scale，避免量级失配过小
+        if self.topic_manager and self.data_scale == 1.0:
+            self.data_scale = getattr(self.topic_manager, "heat_scale", 1.0)
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
-        self._last_step_volume: float = 0.0
+        # 记录上一轮真实总量（未归一化）
+        self._last_step_real_volume: float = 0.0
         hp = hawkes_params or {}
         self.params = {
             "mu_fast": hp.get("mu_fast", 0.5),
@@ -153,8 +163,6 @@ class SocialEnv:
         self.current_intensity = 0.0
         self.phase = "Incubation"
         self.official_has_spoken = False
-        # Hawkes -> 现实发声量的物理映射倍率
-        self.intensity_scale = 1.0
         # 5 大角色声量占比
         self.role_distribution = {
             "Crowd": 0.85,
@@ -171,7 +179,7 @@ class SocialEnv:
         if self._topics:
             self.topic_manager = TopicManager(self._topics, self._hawkes_params)
         self._agent_last_action = {name: 0 for name in self.agents}
-        self._last_step_volume = 0.0
+        self._last_step_real_volume = 0.0
         self.M_fast = 0.0
         self.M_slow = 0.0
         self.current_intensity = 0.0
@@ -415,19 +423,20 @@ class SocialEnv:
 
     def step(self, pr_strategy=None, request_delay: float = 0.0):
         """
-        基于 5 Agent 的变权调度：Hawkes 强度 -> 总量 -> 角色配额 -> 强制动作。
+        双空间映射调度：归一化 Hawkes <-缩放反馈 -> 真实配额强制执行。
         """
         self.t += 1
         new_posts: List[Post] = []
 
-        # --- Phase 1: 宏观反馈 ---
-        if not hasattr(self, "_last_step_volume"):
-            self._last_step_volume = 0.0
-        self._update_hawkes_state(self._last_step_volume)
+        # --- Phase 1: 宏观反馈（归一化） ---
+        if not hasattr(self, "_last_step_real_volume"):
+            self._last_step_real_volume = 0.0
+        norm_feedback = self._last_step_real_volume / max(self.data_scale, 1.0)
+        self._update_hawkes_state(norm_feedback)
 
-        # --- Phase 2: 计算本轮总产量 ---
-        current_intensity = max(0.0, self.current_intensity)
-        total_virtual_events = 0.5 + (current_intensity * self.intensity_scale)
+        # --- Phase 2: 计算本轮真实配额 ---
+        norm_intensity = max(0.0, self.current_intensity)
+        real_total_quota = (0.01 + norm_intensity) * self.data_scale
 
         # --- Phase 3: 构造上下文 ---
         total_heat = 0.0
@@ -438,7 +447,7 @@ class SocialEnv:
         self.phase = self._determine_phase(total_heat)
         env_context = {
             "time": self.t,
-            "global_tension": min(current_intensity / 100.0, 1.0),
+            "global_tension": min(norm_intensity / 5.0, 1.0),
             "topic_heats": topic_heats,
             "phase": self.phase,
         }
@@ -449,19 +458,19 @@ class SocialEnv:
             for p in posts_last_step
         ]
 
-        # --- Phase 4: 按配额强制动作 ---
+        # --- Phase 4: 按真实配额强制执行 ---
         current_step_real_volume = 0.0
         for name, agent in self.agents.items():
             role = getattr(agent, "role", "Crowd")
             ratio = self.role_distribution.get(role, 0.05)
-            my_quota = total_virtual_events * ratio
+            my_real_quota = real_total_quota * ratio
 
             should_act = False
             act_weight = 0.0
-            if my_quota >= 1.0:
+            if my_real_quota >= 1.0:
                 should_act = True
-                act_weight = my_quota
-            elif my_quota > 0.001 and np.random.random() < my_quota:
+                act_weight = my_real_quota
+            elif my_real_quota > 0.001 and random.random() < my_real_quota:
                 should_act = True
                 act_weight = 1.0
 
@@ -496,5 +505,5 @@ class SocialEnv:
                 new_posts.append(self.posts[-1])
                 current_step_real_volume += act_weight
 
-        self._last_step_volume = current_step_real_volume
+        self._last_step_real_volume = current_step_real_volume
         return new_posts

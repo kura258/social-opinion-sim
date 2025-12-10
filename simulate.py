@@ -159,9 +159,9 @@ def simulate_steps(
     else:
         inject_initial_rumor(env, topic=None)
         seed_volume += 1.0
-    # 将初始种子量反馈给 Hawkes，避免首轮强度为 0
-    env._last_step_volume = seed_volume
-    env._update_hawkes_state(seed_volume)
+    # 将初始种子量反馈给 Hawkes（归一化），避免首轮强度为 0
+    env._last_step_real_volume = seed_volume
+    env._update_hawkes_state(seed_volume / max(getattr(env, "data_scale", 1.0), 1.0))
 
     steps = []
     heat_history = []

@@ -76,6 +76,23 @@ class TopicManager:
         hawkes = self.H_base + self.mu_fast * tdata["mem_fast"] + self.mu_slow * tdata["mem_slow"]
         return (base + hawkes) * self.heat_scale
 
+    def decay_to(self, topic: str, current_time: int) -> None:
+        """
+        将记忆衰减到当前时间步（即便本步没有新事件），保证 Hawkes 递推的时间一致性。
+        """
+        if topic not in self.topics:
+            return
+        tdata = self.topics[topic]
+        last_time = tdata["last_time"]
+        dt = (current_time - last_time) if last_time is not None else 0
+        if dt <= 0:
+            return
+        decay_fast = math.exp(-self.lambda_fast * dt)
+        decay_slow = math.exp(-self.lambda_slow * dt)
+        tdata["mem_fast"] = tdata["mem_fast"] * decay_fast
+        tdata["mem_slow"] = tdata["mem_slow"] * decay_slow
+        tdata["last_time"] = current_time
+
     def add_post(
         self,
         topic: str,
@@ -108,8 +125,15 @@ class TopicManager:
 
         tdata["heat"] = self._compute_heat(topic, current_time)
 
-    def get_heat(self, topic: str) -> float:
-        """获取当前热度；未知话题返回 0。"""
+    def get_heat(self, topic: str, current_time: Optional[int] = None) -> float:
+        """
+        获取当前热度；若提供 current_time，则先衰减至当前时间步后返回。
+        """
+        if topic not in self.topics:
+            return 0.0
+        if current_time is not None:
+            self.decay_to(topic, current_time)
+            self.topics[topic]["heat"] = self._compute_heat(topic, current_time)
         return self.topics.get(topic, {}).get("heat", 0.0)
 
 
@@ -153,6 +177,14 @@ class SocialEnv:
         self.topic_backgrounds: Dict[str, str] = {}
         for t in self._topics:
             self.topic_backgrounds[t] = generate_topic_background(t, self.llm_client) if llm_client else f"关于 {t} 的讨论"
+        # 角色分配占比（用于每个话题的配额拆分）
+        self.role_distribution = {
+            "Crowd": 0.85,
+            "Defender": 0.08,
+            "Troll": 0.04,
+            "KOL": 0.02,
+            "BrandOfficial": 0.01,
+        }
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
         # 记录上一轮真实总量（未归一化）
         self._last_step_real_volume: float = 0.0
@@ -435,37 +467,18 @@ class SocialEnv:
 
     def step(self, pr_strategy=None, request_delay: float = 0.0):
         """
-        高精度双向映射调度，严格对齐训练范式。
+        [Final Fix] 分话题确定性调度：逐话题计算预测热度并刚性派发给 Agent。
         """
         self.t += 1
         new_posts: List[Post] = []
 
-        # --- Phase 1: 宏观反馈（归一化） ---
-        if not hasattr(self, "_last_step_real_volume"):
-            self._last_step_real_volume = 0.0
-        norm_feedback = self._last_step_real_volume / max(self.data_scale, 1.0)
-        self._update_hawkes_state(norm_feedback)
-
-        # --- Phase 2: 计算本轮真实配额 ---
-        norm_intensity = max(0.0, self.current_intensity)
-        real_total_quota = norm_intensity * self.data_scale
-        # 冷启动保护：首步至少 1 个单位，避免完全静默
-        if self.t == 1 and real_total_quota < 1.0:
-            real_total_quota = 1.0
-
-        # --- Phase 3: 构造上下文 ---
-        total_heat = 0.0
-        topic_heats = {}
+        # --- 构造上下文 & 预测每个话题的目标热度 ---
+        topic_heats: Dict[str, float] = {}
         if self.topic_manager and self._topics:
-            topic_heats = {tp: self.topic_manager.get_heat(tp) for tp in self._topics}
-            total_heat = sum(topic_heats.values())
+            for tp in self._topics:
+                topic_heats[tp] = self.topic_manager.get_heat(tp, current_time=self.t)
+        total_heat = sum(topic_heats.values())
         self.phase = self._determine_phase(total_heat)
-        env_context = {
-            "time": self.t,
-            "global_tension": min(norm_intensity / 5.0, 1.0),
-            "topic_heats": topic_heats,
-            "phase": self.phase,
-        }
 
         posts_last_step = [p for p in self.posts if p.time_step == self.t - 1]
         observed = [
@@ -473,53 +486,47 @@ class SocialEnv:
             for p in posts_last_step
         ]
 
-        # --- Phase 4: 按真实配额强制执行（按 persona 权重分配） ---
-        current_step_real_volume = 0.0
+        # --- 核心：按话题拆分目标量并强制执行 ---
         total_weight_ratio = sum(getattr(a, "weight_ratio", 1.0) for a in self.agents.values()) or 1.0
-        for name, agent in self.agents.items():
-            my_real_quota = real_total_quota * (getattr(agent, "weight_ratio", 1.0) / total_weight_ratio)
+        for topic, target_heat in topic_heats.items():
+            target_volume = max(target_heat, 0.5)  # 保底避免话题彻底熄火
+            for name, agent in self.agents.items():
+                role = getattr(agent, "role", "Crowd")
+                share_ratio = self.role_distribution.get(role, 0.05)
+                my_quota = target_volume * share_ratio * (getattr(agent, "weight_ratio", 1.0) / total_weight_ratio)
+                if my_quota < 0.1:
+                    continue
 
-            should_act = False
-            act_weight = 0.0
-            if my_real_quota >= 1.0:
-                should_act = True
-                act_weight = my_real_quota
-            elif my_real_quota > 0.0001 and random.random() < my_real_quota:
-                should_act = True
-                act_weight = 1.0
+                ctx = {
+                    "time": self.t,
+                    "phase": self.phase,
+                    "topic_bg": self.topic_backgrounds.get(topic, f"关于 {topic} 的讨论"),
+                    "tension": min(target_heat / max(self.data_scale, 1.0), 1.0),
+                }
 
-            if not should_act:
-                continue
+                action = None
+                if hasattr(agent, "force_action_on_topic"):
+                    try:
+                        action = agent.force_action_on_topic(topic, ctx, observed, my_quota)
+                    except Exception:
+                        action = None
 
-            action = None
-            if hasattr(agent, "force_action"):
-                try:
-                    ctx = dict(env_context)
-                    ctx["topic_backgrounds"] = self.topic_backgrounds
-                    action = agent.force_action(ctx, observed)
-                except Exception:
-                    action = None
+                if action and action.get("action") in ["post", "retweet"]:
+                    act_type = action.get("action")
+                    sentiment = action.get("sentiment", "NEUTRAL")
+                    tag = action.get("tag", "user" if act_type == "post" else "retweet")
+                    post_text = action.get("post_text", action.get("text", ""))
+                    target_id = action.get("target_post_id")
+                    self._add_post(
+                        author=name,
+                        text=post_text,
+                        sentiment=sentiment,
+                        tag=tag,
+                        target_post_id=target_id,
+                        topic=topic,
+                        count=my_quota,
+                    )
+                    self._agent_last_action[name] = self.t
+                    new_posts.append(self.posts[-1])
 
-            if action and action.get("action") in ["post", "retweet"]:
-                act_type = action.get("action")
-                sentiment = action.get("sentiment", "NEUTRAL")
-                tag = action.get("tag", "user" if act_type == "post" else "retweet")
-                post_text = action.get("post_text", action.get("text", ""))
-                target_id = action.get("target_post_id")
-                topic = action.get("topic")
-
-                self._add_post(
-                    author=name,
-                    text=post_text,
-                    sentiment=sentiment,
-                    tag=tag,
-                    target_post_id=target_id,
-                    topic=topic,
-                    count=act_weight,
-                )
-                self._agent_last_action[name] = self.t
-                new_posts.append(self.posts[-1])
-                current_step_real_volume += act_weight
-
-        self._last_step_real_volume = current_step_real_volume
         return new_posts

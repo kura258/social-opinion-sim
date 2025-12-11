@@ -445,16 +445,22 @@ class Agent:
     # 强制发声模式（阵营代表）
     # ------------------------------------------------------------------
     def force_action(self, env_context: dict, observed_posts: list) -> Dict[str, Any]:
-        """
-        阵营代表强制发声模式：无需个体意愿，直接按配额执行。
-        """
+        """兼容旧接口，默认选题后调用指定话题模式。"""
         topic = self._choose_topic_under_pressure(env_context)
-        topic_bg = ""
-        if env_context:
-            topic_bg = env_context.get("topic_backgrounds", {}).get(topic, f"关于 {topic} 的讨论")
-        if self.driver_mode == "brain":
-            return self._decide_by_llm_force(topic, topic_bg, env_context, observed_posts)
-        return self._decide_by_reflex_force(topic, topic_bg, env_context, observed_posts)
+        return self.force_action_on_topic(topic, env_context or {}, observed_posts, weight=1.0)
+
+    def force_action_on_topic(self, topic: str, ctx: dict, observed_posts: list, weight: float) -> Dict[str, Any]:
+        """
+        指定话题模式：由环境分配 topic 与配额，避免羊群效应。
+        """
+        topic_bg = ctx.get("topic_bg", f"关于 {topic} 的讨论")
+        tension = ctx.get("tension", 0.0)
+        related_posts = [p for p in observed_posts if p.get("topic") == topic]
+        refs = random.sample(related_posts, min(len(related_posts), 2)) if related_posts else []
+        use_brain = (self.driver_mode == "brain") or (weight > 10.0) or (random.random() < 0.1)
+        if use_brain:
+            return self._decide_by_llm_topic(topic, topic_bg, tension, refs)
+        return self._decide_by_reflex_topic(topic, topic_bg, refs)
 
     def _choose_topic_under_pressure(self, env_context: dict) -> str:
         topic_heats = env_context.get("topic_heats", {}) if env_context else {}
@@ -468,55 +474,66 @@ class Agent:
         weights = weights / weights.sum()
         return np.random.choice(topics, p=weights)
 
-    def _decide_by_reflex_force(self, topic, topic_bg, env_context, observed_posts):
-        related_posts = [p for p in observed_posts if p.get("topic") == topic]
+    def _decide_by_llm_topic(self, topic, topic_bg, tension, refs):
+        ref_text = ""
+        if refs:
+            ref_text = "【广场上的声音】\n" + "\n".join([f"- {p['author']}: {p['text'][:30]}..." for p in refs])
+        else:
+            ref_text = "（当前广场暂无相关讨论，你是第一批讨论者）"
+        system = f"""
+身份：{self.name} ({self.role})
+人设：{self.profile}
+当前任务：针对话题 #{topic}# 发表观点。
+"""
+        user = f"""
+【事件背景】：{topic_bg}
+【当前舆论环境】：紧张度 {tension:.2f}/1.0
+{ref_text}
+
+请发布一条微博。
+要求：
+1. 语气必须符合人设。
+2. 若有“广场声音”，请反驳/附和/阴阳怪气其中一条，不要自说自话。
+3. 内容口语化、简短。
+4. 返回JSON: {{"action": "post" 或 "retweet", "post_text": "...", "topic": "{topic}"}}"""
+        try:
+            resp = self.llm.chat(system, user, temperature=0.8 + 0.2 * tension)
+            import json
+            parsed = json.loads(resp)
+            parsed.setdefault("topic", topic)
+            parsed.setdefault("sentiment", "NEUTRAL")
+            return parsed
+        except Exception:
+            return {
+                "action": "post",
+                "topic": topic,
+                "post_text": f"关注 #{topic}#，这就离谱。",
+                "sentiment": "NEUTRAL",
+            }
+
+    def _decide_by_reflex_topic(self, topic, topic_bg, refs):
         action_type = "post"
         target_id = None
-        if self.role == "Crowd":
-            if related_posts and np.random.random() < 0.7:
-                action_type = "retweet"
-                target = np.random.choice(related_posts)
-                target_id = target.get("id")
-        elif self.role == "KOL":
-            action_type = "post"
+        text = ""
+        if self.role == "Crowd" and refs and random.random() < 0.8:
+            action_type = "retweet"
+            target = random.choice(refs)
+            target_id = target.get("id")
+            comments = ["确实", "666", "无法反驳", "这就触及到知识盲区了", "转发微博", "Mark"]
+            text = random.choice(comments)
+        else:
+            templates = [
+                f"最近大家都在聊 #{topic}#，我也来看看。",
+                f"#{topic}# 这事儿怎么看？",
+                f"关注一下 #{topic}#。",
+                f"#{topic}# 有点意思。",
+            ]
+            text = random.choice(templates)
         return {
             "action": action_type,
             "topic": topic,
             "target_post_id": target_id,
-            "post_text": f"【{self.role}发声】关注话题 #{topic}#，{topic_bg[:40]}",
-            "sentiment": "NEUTRAL",
-            "tag": "user",
-        }
-
-    def _decide_by_llm_force(self, topic, topic_bg, env_context, observed_posts):
-        tension_level = env_context.get("global_tension", 0.0) if env_context else 0.0
-        temperature = 0.7 + 0.3 * tension_level
-        system = f"""
-你正在进行一场真实的社交媒体模拟。
-你的身份：{self.name}
-你的人设：{self.profile}
-"""
-        user = f"""
-当前话题：#{topic}#
-事件背景：{topic_bg}
-全网紧张度：{tension_level:.2f} (0-1)
-请基于人设和背景发一条微博，必须是 JSON:
-{{"action": "post" 或 "retweet", "post_text": "...", "topic": "{topic}"}}"""
-        try:
-            resp = self.llm.chat(system, user, temperature=temperature)
-            import json
-            parsed = json.loads(resp)
-            if parsed.get("action") in ["post", "retweet"]:
-                parsed.setdefault("post_text", f"大家怎么看 #{topic}#")
-                parsed.setdefault("topic", topic)
-                parsed.setdefault("sentiment", "NEUTRAL")
-                return parsed
-        except Exception:
-            pass
-        return {
-            "action": "post",
-            "topic": topic,
-            "post_text": f"大家怎么看 #{topic}#，{topic_bg[:40]}",
+            "post_text": text,
             "sentiment": "NEUTRAL",
             "tag": "user",
         }

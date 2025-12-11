@@ -8,7 +8,11 @@ import random
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 
+from config.settings import DEFAULT_REAL_DATA_PATH
+from config.personas import PERSONAS
+from utils.topic_helper import generate_topic_background
 
 @dataclass
 class Post:
@@ -24,16 +28,18 @@ class Post:
 
 class TopicManager:
     """
-    维护话题热度，混合基础统计与简化的 Hawkes 记忆项。
+    维护话题热度。
+    【重要优化】移除基础统计干扰，严格遵循训练出的纯 Hawkes 范式。
     """
 
     def __init__(self, topics: Sequence[str], hawkes_params: Optional[Dict[str, float]] = None):
         params = hawkes_params or {}
-        self.alpha_v = params.get("alpha_v", params.get("alpha", 1.0))
-        self.beta_c = params.get("beta_c", params.get("beta", 0.5))
-        self.gamma_r = params.get("gamma_r", params.get("gamma", 0.3))
-        # 训练集热度量级（可调），通过 heat_scale 做线性放大，便于对齐真实数据
-        self.heat_scale = params.get("heat_scale", 1e4)
+        # 强制将基础统计项设为 0，消除模型结构偏差
+        self.alpha_v = 0.0
+        self.beta_c = 0.0
+        self.gamma_r = 0.0
+        # 训练集热度量级，严格用于缩放
+        self.heat_scale = params.get("heat_scale", 1.0)
         # 双衰减核参数（与训练保持一致）
         self.H_base = params.get("H_base", 0.0)
         self.mu_fast = params.get("mu_fast", params.get("mu", 0.5))
@@ -49,6 +55,7 @@ class TopicManager:
         self.topics: Dict[str, Dict[str, Any]] = {
             topic: {
                 "heat": 0.0,
+                "heat_raw": self.H_base,
                 "posts": [],
                 "events": [],
                 "per_step": {},  # t -> {"V": count, "C": 评论数, "R": reach}
@@ -57,18 +64,11 @@ class TopicManager:
                 "last_time": None,
             } for topic in topics
         }
+        for t in self.topics:
+            self.topics[t]["heat"] = self.H_base * self.heat_scale
 
     def _compute_base(self, topic: str, current_time: int) -> float:
-        tdata = self.topics[topic]
-        stats = tdata["per_step"].get(current_time, {"V": 0, "C": 0, "R": 0})
-        V = stats["V"]
-        C = stats["C"]
-        R = stats["R"]
-        return (
-            self.alpha_v * math.log(V + 1)
-            + self.beta_c * math.log(C + 1)
-            + self.gamma_r * math.log(R + 1)
-        )
+        return 0.0
 
     def _compute_heat(self, topic: str, current_time: int) -> float:
         tdata = self.topics[topic]
@@ -129,24 +129,30 @@ class SocialEnv:
         graph: nx.DiGraph,
         topics: Optional[Sequence[str]] = None,
         hawkes_params: Optional[Dict[str, float]] = None,
+        llm_client=None,
     ):
+        self.llm_client = llm_client
         self.agents = agents
         self.G = graph
         self.posts: List[Post] = []
         self.t = 0
         self._next_post_id = 1
         self._topics = list(topics) if topics else []
-        self._hawkes_params = hawkes_params
-        # 数据归一化尺度，需与训练时的 heat_scale 对齐
-        self.data_scale = 1.0
-        if hawkes_params and "heat_scale" in hawkes_params:
-            self.data_scale = hawkes_params["heat_scale"]
+        # 统一处理参数，确保 heat_scale 与真实数据量级对齐
+        params = dict(hawkes_params or {})
+        inferred_scale = params.get("heat_scale")
+        if not inferred_scale or inferred_scale <= 1.0:
+            inferred_scale = self._infer_data_scale(self._topics)
+        params["heat_scale"] = inferred_scale
+        self.data_scale = inferred_scale
+        self._hawkes_params = params
         self.topic_manager: Optional[TopicManager] = (
-            TopicManager(self._topics, hawkes_params) if self._topics else None
+            TopicManager(self._topics, params) if self._topics else None
         )
-        # 如未显式传入，则回退使用 TopicManager 的 heat_scale，避免量级失配过小
-        if self.topic_manager and self.data_scale == 1.0:
-            self.data_scale = getattr(self.topic_manager, "heat_scale", 1.0)
+        # 话题背景
+        self.topic_backgrounds: Dict[str, str] = {}
+        for t in self._topics:
+            self.topic_backgrounds[t] = generate_topic_background(t, self.llm_client) if llm_client else f"关于 {t} 的讨论"
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
         # 记录上一轮真实总量（未归一化）
         self._last_step_real_volume: float = 0.0
@@ -163,15 +169,6 @@ class SocialEnv:
         self.current_intensity = 0.0
         self.phase = "Incubation"
         self.official_has_spoken = False
-        # 5 大角色声量占比
-        self.role_distribution = {
-            "Crowd": 0.85,
-            "Defender": 0.08,
-            "Troll": 0.04,
-            "KOL": 0.02,
-            "BrandOfficial": 0.01,
-        }
-
     def reset(self):
         self.posts = []
         self.t = 0
@@ -421,9 +418,24 @@ class SocialEnv:
                 continue
         return new_posts
 
+    def _infer_data_scale(self, topics: Sequence[str]) -> float:
+        """
+        根据默认真实数据计算所选话题的最大热度作为 scale，避免归一化过度。
+        """
+        if not topics or not DEFAULT_REAL_DATA_PATH.exists():
+            return 1.0
+        try:
+            df = pd.read_csv(DEFAULT_REAL_DATA_PATH)
+            df = df[df["topic"].isin(topics)]
+            if df.empty or "heat" not in df.columns:
+                return 1.0
+            return float(df["heat"].max())
+        except Exception:
+            return 1.0
+
     def step(self, pr_strategy=None, request_delay: float = 0.0):
         """
-        双空间映射调度：归一化 Hawkes <-缩放反馈 -> 真实配额强制执行。
+        高精度双向映射调度，严格对齐训练范式。
         """
         self.t += 1
         new_posts: List[Post] = []
@@ -436,7 +448,10 @@ class SocialEnv:
 
         # --- Phase 2: 计算本轮真实配额 ---
         norm_intensity = max(0.0, self.current_intensity)
-        real_total_quota = (0.01 + norm_intensity) * self.data_scale
+        real_total_quota = norm_intensity * self.data_scale
+        # 冷启动保护：首步至少 1 个单位，避免完全静默
+        if self.t == 1 and real_total_quota < 1.0:
+            real_total_quota = 1.0
 
         # --- Phase 3: 构造上下文 ---
         total_heat = 0.0
@@ -458,19 +473,18 @@ class SocialEnv:
             for p in posts_last_step
         ]
 
-        # --- Phase 4: 按真实配额强制执行 ---
+        # --- Phase 4: 按真实配额强制执行（按 persona 权重分配） ---
         current_step_real_volume = 0.0
+        total_weight_ratio = sum(getattr(a, "weight_ratio", 1.0) for a in self.agents.values()) or 1.0
         for name, agent in self.agents.items():
-            role = getattr(agent, "role", "Crowd")
-            ratio = self.role_distribution.get(role, 0.05)
-            my_real_quota = real_total_quota * ratio
+            my_real_quota = real_total_quota * (getattr(agent, "weight_ratio", 1.0) / total_weight_ratio)
 
             should_act = False
             act_weight = 0.0
             if my_real_quota >= 1.0:
                 should_act = True
                 act_weight = my_real_quota
-            elif my_real_quota > 0.001 and random.random() < my_real_quota:
+            elif my_real_quota > 0.0001 and random.random() < my_real_quota:
                 should_act = True
                 act_weight = 1.0
 
@@ -480,7 +494,9 @@ class SocialEnv:
             action = None
             if hasattr(agent, "force_action"):
                 try:
-                    action = agent.force_action(env_context, observed)
+                    ctx = dict(env_context)
+                    ctx["topic_backgrounds"] = self.topic_backgrounds
+                    action = agent.force_action(ctx, observed)
                 except Exception:
                     action = None
 

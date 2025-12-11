@@ -17,6 +17,7 @@ from config.settings import (
     DEFAULT_TOPICS,
     load_hawkes_params,
 )
+from config.personas import PERSONAS
 # 把项目根目录加入模块搜索路径
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 if CURRENT_DIR not in sys.path:
@@ -39,49 +40,18 @@ def pick_default_topics(seed: int = DEFAULT_SIM_SEED, k: int = 5) -> List[str]:
 
 
 def build_agents(llm: LLMClient, topics: Optional[List[str]] = None) -> Dict[str, Agent]:
-    """构建 5 个代表性画像的微博生态 Agent。"""
+    """构建 20 个具体画像的微博 Agent。"""
     agents: Dict[str, Agent] = {}
-
-    agents["BrandOfficial"] = Agent(
-        name="BrandOfficial",
-        role="BrandOfficial",
-        profile="权威媒体/官方：客观、冷静、强调核实，不信谣不传谣。",
-        llm_client=llm,
-        topics=topics,
-    )
-
-    agents["KOL"] = Agent(
-        name="KOL",
-        role="KOL",
-        profile="意见领袖/营销号：爱带节奏，反问、悬念、情绪化吸引流量。",
-        llm_client=llm,
-        topics=topics,
-    )
-
-    agents["Troll"] = Agent(
-        name="Troll",
-        role="Troll",
-        profile="极端情绪/杠精：尖锐、嘲讽、挑衅，擅长制造冲突。",
-        llm_client=llm,
-        topics=topics,
-    )
-
-    agents["Defender"] = Agent(
-        name="Defender",
-        role="Defender",
-        profile="死忠粉/护卫队：极度护短，控评、呼吁理性，抵制黑子。",
-        llm_client=llm,
-        topics=topics,
-    )
-
-    agents["Crowd"] = Agent(
-        name="Crowd",
-        role="Crowd",
-        profile="吃瓜群众：路人心态，简短跟风，热度高时才出现。",
-        llm_client=llm,
-        topics=topics,
-    )
-
+    for persona in PERSONAS:
+        agent = Agent(
+            name=persona["name"],
+            role=persona["role"],
+            profile=persona["profile"],
+            llm_client=llm,
+            topics=topics,
+        )
+        agent.weight_ratio = persona.get("weight_ratio", 1.0)
+        agents[agent.name] = agent
     return agents
 
 
@@ -148,7 +118,7 @@ def simulate_steps(
     llm = LLMClient()
     agents = build_agents(llm, topics=topics)
     G = build_graph(agents.keys())
-    env = SocialEnv(agents, G, topics=topics, hawkes_params=hawkes_params or BEST_HAWKES_PARAMS)
+    env = SocialEnv(agents, G, topics=topics, hawkes_params=hawkes_params or BEST_HAWKES_PARAMS, llm_client=llm)
 
     # 初始爆料：为每个话题种子一条（若未提供话题，则发一条默认）
     seed_volume = 0.0

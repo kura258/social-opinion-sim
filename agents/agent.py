@@ -449,9 +449,12 @@ class Agent:
         阵营代表强制发声模式：无需个体意愿，直接按配额执行。
         """
         topic = self._choose_topic_under_pressure(env_context)
+        topic_bg = ""
+        if env_context:
+            topic_bg = env_context.get("topic_backgrounds", {}).get(topic, f"关于 {topic} 的讨论")
         if self.driver_mode == "brain":
-            return self._decide_by_llm_force(topic, env_context, observed_posts)
-        return self._decide_by_reflex_force(topic, env_context, observed_posts)
+            return self._decide_by_llm_force(topic, topic_bg, env_context, observed_posts)
+        return self._decide_by_reflex_force(topic, topic_bg, env_context, observed_posts)
 
     def _choose_topic_under_pressure(self, env_context: dict) -> str:
         topic_heats = env_context.get("topic_heats", {}) if env_context else {}
@@ -459,11 +462,13 @@ class Agent:
             return self.topics[0] if self.topics else "General"
         topics = list(topic_heats.keys())
         heats = np.array([topic_heats[t] for t in topics], dtype=float)
-        if np.random.random() < 0.8:
-            return topics[int(np.argmax(heats))]
-        return np.random.choice(topics)
+        # Softmax 方式择优，避免所有人只盯最热话题导致曲线失真
+        temp = 0.8
+        weights = np.exp((heats - heats.max()) / max(temp, 1e-6))
+        weights = weights / weights.sum()
+        return np.random.choice(topics, p=weights)
 
-    def _decide_by_reflex_force(self, topic, env_context, observed_posts):
+    def _decide_by_reflex_force(self, topic, topic_bg, env_context, observed_posts):
         related_posts = [p for p in observed_posts if p.get("topic") == topic]
         action_type = "post"
         target_id = None
@@ -478,22 +483,28 @@ class Agent:
             "action": action_type,
             "topic": topic,
             "target_post_id": target_id,
-            "post_text": f"【{self.role}发声】关注话题 #{topic}#",
+            "post_text": f"【{self.role}发声】关注话题 #{topic}#，{topic_bg[:40]}",
             "sentiment": "NEUTRAL",
             "tag": "user",
         }
 
-    def _decide_by_llm_force(self, topic, env_context, observed_posts):
-        system = (
-            f"你是 {self.name} ({self.role})。现在全网都在讨论【{topic}】。"
-            "请你必须生成一条微博，输出合法 JSON："
-            '{"action": "post"或"retweet", "post_text": "..."}'
-        )
-        user = ""
+    def _decide_by_llm_force(self, topic, topic_bg, env_context, observed_posts):
+        tension_level = env_context.get("global_tension", 0.0) if env_context else 0.0
+        temperature = 0.7 + 0.3 * tension_level
+        system = f"""
+你正在进行一场真实的社交媒体模拟。
+你的身份：{self.name}
+你的人设：{self.profile}
+"""
+        user = f"""
+当前话题：#{topic}#
+事件背景：{topic_bg}
+全网紧张度：{tension_level:.2f} (0-1)
+请基于人设和背景发一条微博，必须是 JSON:
+{{"action": "post" 或 "retweet", "post_text": "...", "topic": "{topic}"}}"""
         try:
-            resp = self.llm.chat(system, user)
+            resp = self.llm.chat(system, user, temperature=temperature)
             import json
-
             parsed = json.loads(resp)
             if parsed.get("action") in ["post", "retweet"]:
                 parsed.setdefault("post_text", f"大家怎么看 #{topic}#")
@@ -505,7 +516,7 @@ class Agent:
         return {
             "action": "post",
             "topic": topic,
-            "post_text": f"大家怎么看 #{topic}#",
+            "post_text": f"大家怎么看 #{topic}#，{topic_bg[:40]}",
             "sentiment": "NEUTRAL",
             "tag": "user",
         }

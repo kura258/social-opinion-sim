@@ -47,6 +47,8 @@ DEFAULT_HAWKES_PARAMS: Dict[str, float] = {
     "H_base": 1.8134757737318496,
     "lambda_fast": 4.996698275314672,
     "lambda_slow": 0.663701052879747,
+    # 训练时使用的归一化尺度（数据集最大热度）；用于仿真时上下行映射
+    "heat_scale": 9120161.0,
 }
 HAWKES_PARAM_PATH = Path(
     os.getenv("HAWKES_PARAM_PATH", PROJECT_ROOT / "artifacts" / "hawkes_params.json")

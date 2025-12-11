@@ -107,6 +107,8 @@ def simulate_steps(
     topics: Optional[List[str]] = None,
     request_delay: float = 0.0,
     hawkes_params: Optional[dict] = None,
+    fixed_heat_scale: Optional[float] = None,
+    initial_topic_heats: Optional[dict] = None,
 ):
     """
     运行多时间步模拟，返回环境、每步新增帖子列表、以及话题热度快照。
@@ -118,7 +120,15 @@ def simulate_steps(
     llm = LLMClient()
     agents = build_agents(llm, topics=topics)
     G = build_graph(agents.keys())
-    env = SocialEnv(agents, G, topics=topics, hawkes_params=hawkes_params or BEST_HAWKES_PARAMS, llm_client=llm)
+    env = SocialEnv(
+        agents,
+        G,
+        topics=topics,
+        hawkes_params=hawkes_params or BEST_HAWKES_PARAMS,
+        llm_client=llm,
+        fixed_heat_scale=fixed_heat_scale,
+        initial_topic_heats=initial_topic_heats,
+    )
 
     # 初始爆料：为每个话题种子一条（若未提供话题，则发一条默认）
     seed_volume = 0.0

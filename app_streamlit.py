@@ -1,5 +1,5 @@
 ﻿import time
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pathlib import Path
 
 import pandas as pd
@@ -192,14 +192,41 @@ def main():
     topics = [t.strip() for t in raw_topics.split(",") if t.strip()]
     real_file = st.sidebar.file_uploader("上传真实热度 CSV (列: time, topic, heat)", type=["csv"])
     use_default_real = st.sidebar.checkbox("使用默认真实数据（最新训练集）", value=True)
+    real_heat_scale = 1.0
+    initial_heats: Dict[str, float] = {}
 
     if st.button("开始模拟"):
         st.info("正在创建环境并运行，请稍候...")
+        # 读取真实数据并推断 scale/初始热度
+        real_df = None
+        if real_file:
+            try:
+                real_df = pd.read_csv(real_file)
+            except Exception as e:
+                st.error(f"真实数据读取失败: {e}")
+                real_df = None
+        elif use_default_real and DEFAULT_REAL_DATA_PATH.exists():
+            real_df = pd.read_csv(DEFAULT_REAL_DATA_PATH)
+
+        if real_df is not None and "heat" in real_df.columns:
+            real_heat_scale = float(real_df["heat"].max())
+            st.success(f"检测到真实数据量级 (Scale): {real_heat_scale:,.0f}")
+            if {"topic", "timestamp", "heat"} <= set(real_df.columns):
+                df_sorted = real_df.sort_values("timestamp")
+                for tp in df_sorted["topic"].unique():
+                    first_row = df_sorted[df_sorted["topic"] == tp].iloc[0]
+                    initial_heats[tp] = float(first_row["heat"])
+        else:
+            st.warning("未检测到真实数据或缺少 heat 列，使用默认 Scale=1.0")
+
         env, steps, heat_history = simulate_steps(
             T=T,
             seed=base_seed,
             topics=topics,
             request_delay=request_delay,
+            hawkes_params={"heat_scale": real_heat_scale},
+            fixed_heat_scale=real_heat_scale,
+            initial_topic_heats=initial_heats,
         )
         st.success("模拟完成")
 

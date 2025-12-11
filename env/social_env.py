@@ -32,7 +32,12 @@ class TopicManager:
     【重要优化】移除基础统计干扰，严格遵循训练出的纯 Hawkes 范式。
     """
 
-    def __init__(self, topics: Sequence[str], hawkes_params: Optional[Dict[str, float]] = None):
+    def __init__(
+        self,
+        topics: Sequence[str],
+        hawkes_params: Optional[Dict[str, float]] = None,
+        initial_heats: Optional[Dict[str, float]] = None,
+    ):
         params = hawkes_params or {}
         # 强制将基础统计项设为 0，消除模型结构偏差
         self.alpha_v = 0.0
@@ -52,20 +57,21 @@ class TopicManager:
         if self.lambda_slow >= self.lambda_fast:
             self.lambda_slow = max(self.lambda_fast * 0.8, 1e-6)
 
-        self.topics: Dict[str, Dict[str, Any]] = {
-            topic: {
-                "heat": 0.0,
-                "heat_raw": self.H_base,
+        init_map = initial_heats or {}
+        self.topics: Dict[str, Dict[str, Any]] = {}
+        for topic in topics:
+            start_heat = init_map.get(topic, self.H_base * self.heat_scale)
+            norm_heat = start_heat / max(self.heat_scale, 1.0)
+            approx_mem = max(0.0, (norm_heat - self.H_base) / (self.mu_fast + self.mu_slow + 1e-6))
+            self.topics[topic] = {
+                "heat": start_heat,
                 "posts": [],
                 "events": [],
-                "per_step": {},  # t -> {"V": count, "C": 评论数, "R": reach}
-                "mem_fast": 0.0,
-                "mem_slow": 0.0,
+                "per_step": {},
+                "mem_fast": approx_mem,
+                "mem_slow": approx_mem,
                 "last_time": None,
-            } for topic in topics
-        }
-        for t in self.topics:
-            self.topics[t]["heat"] = self.H_base * self.heat_scale
+            }
 
     def _compute_base(self, topic: str, current_time: int) -> float:
         return 0.0
@@ -154,6 +160,8 @@ class SocialEnv:
         topics: Optional[Sequence[str]] = None,
         hawkes_params: Optional[Dict[str, float]] = None,
         llm_client=None,
+        fixed_heat_scale: Optional[float] = None,
+        initial_topic_heats: Optional[Dict[str, float]] = None,
     ):
         self.llm_client = llm_client
         self.agents = agents
@@ -164,14 +172,14 @@ class SocialEnv:
         self._topics = list(topics) if topics else []
         # 统一处理参数，确保 heat_scale 与真实数据量级对齐
         params = dict(hawkes_params or {})
-        inferred_scale = params.get("heat_scale")
+        inferred_scale = fixed_heat_scale if fixed_heat_scale and fixed_heat_scale > 0 else params.get("heat_scale")
         if not inferred_scale or inferred_scale <= 1.0:
             inferred_scale = self._infer_data_scale(self._topics)
         params["heat_scale"] = inferred_scale
         self.data_scale = inferred_scale
         self._hawkes_params = params
         self.topic_manager: Optional[TopicManager] = (
-            TopicManager(self._topics, params) if self._topics else None
+            TopicManager(self._topics, params, initial_topic_heats) if self._topics else None
         )
         # 话题背景
         self.topic_backgrounds: Dict[str, str] = {}
@@ -486,28 +494,40 @@ class SocialEnv:
             for p in posts_last_step
         ]
 
-        # --- 核心：按话题拆分目标量并强制执行 ---
+        # --- 核心：按话题拆分目标量并强制执行（精英制，限发言人数） ---
         total_weight_ratio = sum(getattr(a, "weight_ratio", 1.0) for a in self.agents.values()) or 1.0
+        MAX_POSTS_PER_TOPIC = 3
         for topic, target_heat in topic_heats.items():
-            target_volume = max(target_heat, 0.5)  # 保底避免话题彻底熄火
-            for name, agent in self.agents.items():
-                role = getattr(agent, "role", "Crowd")
-                share_ratio = self.role_distribution.get(role, 0.05)
-                my_quota = target_volume * share_ratio * (getattr(agent, "weight_ratio", 1.0) / total_weight_ratio)
-                if my_quota < 0.1:
-                    continue
+            if target_heat < (self.data_scale * 0.0001):
+                continue
+            num_speakers = min(MAX_POSTS_PER_TOPIC, len(self.agents))
+            quota_per_speaker = target_heat / max(num_speakers, 1)
+            candidates = list(self.agents.keys())
+            weights = [getattr(self.agents[n], "weight_ratio", 1.0) for n in candidates]
+            w_sum = sum(weights)
+            probs = [w / w_sum for w in weights] if w_sum > 0 else None
+            chosen_names = np.random.choice(candidates, size=num_speakers, replace=False, p=probs)
 
+            for name in chosen_names:
+                agent = self.agents[name]
                 ctx = {
                     "time": self.t,
                     "phase": self.phase,
-                    "topic_bg": self.topic_backgrounds.get(topic, f"关于 {topic} 的讨论"),
+                    "topic_bg": self.topic_backgrounds.get(topic, f"关于 {topic} 的热议"),
                     "tension": min(target_heat / max(self.data_scale, 1.0), 1.0),
                 }
+                topic_related_posts = [
+                    p for p in self.posts if p.topic == topic and p.time_step >= self.t - 5
+                ]
+                obs_for_topic = [
+                    {"id": p.id, "author": p.author, "text": p.text, "topic": p.topic}
+                    for p in topic_related_posts[-3:]
+                ]
 
                 action = None
                 if hasattr(agent, "force_action_on_topic"):
                     try:
-                        action = agent.force_action_on_topic(topic, ctx, observed, my_quota)
+                        action = agent.force_action_on_topic(topic, ctx, obs_for_topic, quota_per_speaker)
                     except Exception:
                         action = None
 
@@ -524,7 +544,7 @@ class SocialEnv:
                         tag=tag,
                         target_post_id=target_id,
                         topic=topic,
-                        count=my_quota,
+                        count=quota_per_speaker,
                     )
                     self._agent_last_action[name] = self.t
                     new_posts.append(self.posts[-1])

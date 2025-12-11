@@ -109,6 +109,7 @@ def simulate_steps(
     hawkes_params: Optional[dict] = None,
     fixed_heat_scale: Optional[float] = None,
     initial_topic_heats: Optional[dict] = None,
+    real_heat_trajectory: Optional[dict] = None,
 ):
     """
     运行多时间步模拟，返回环境、每步新增帖子列表、以及话题热度快照。
@@ -128,6 +129,7 @@ def simulate_steps(
         llm_client=llm,
         fixed_heat_scale=fixed_heat_scale,
         initial_topic_heats=initial_topic_heats,
+        real_heat_trajectory=real_heat_trajectory,
     )
 
     # 初始爆料：为每个话题种子一条（若未提供话题，则发一条默认）

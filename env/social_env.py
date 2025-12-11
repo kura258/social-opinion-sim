@@ -162,6 +162,7 @@ class SocialEnv:
         llm_client=None,
         fixed_heat_scale: Optional[float] = None,
         initial_topic_heats: Optional[Dict[str, float]] = None,
+        real_heat_trajectory: Optional[Dict[str, List[float]]] = None,
     ):
         self.llm_client = llm_client
         self.agents = agents
@@ -193,6 +194,8 @@ class SocialEnv:
             "KOL": 0.02,
             "BrandOfficial": 0.01,
         }
+        # 真实热度轨迹，用于数据制导
+        self.real_heat_trajectory = real_heat_trajectory or {}
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
         # 记录上一轮真实总量（未归一化）
         self._last_step_real_volume: float = 0.0
@@ -475,17 +478,35 @@ class SocialEnv:
 
     def step(self, pr_strategy=None, request_delay: float = 0.0):
         """
-        [Final Fix] 分话题确定性调度：逐话题计算预测热度并刚性派发给 Agent。
+        [混合动力调度]
+        有真实数据时用真实热度指挥；无数据时用 Hawkes 惯性预测。
         """
         self.t += 1
         new_posts: List[Post] = []
 
-        # --- 构造上下文 & 预测每个话题的目标热度 ---
-        topic_heats: Dict[str, float] = {}
+        # --- 内生预测（兜底） ---
+        hawkes_preds: Dict[str, float] = {}
         if self.topic_manager and self._topics:
             for tp in self._topics:
-                topic_heats[tp] = self.topic_manager.get_heat(tp, current_time=self.t)
-        total_heat = sum(topic_heats.values())
+                hawkes_preds[tp] = self.topic_manager.get_heat(tp, current_time=self.t)
+
+        # --- 数据制导：决定目标热度 ---
+        target_heats: Dict[str, float] = {}
+        mode_log: Dict[str, str] = {}
+        for topic in self._topics:
+            real_traj = self.real_heat_trajectory.get(topic, [])
+            idx = self.t - 1
+            if 0 <= idx < len(real_traj):
+                target_heats[topic] = float(real_traj[idx])
+                mode_log[topic] = "GUIDED"
+            else:
+                pred_val = hawkes_preds.get(topic, 0.0)
+                if self.t == 1 and pred_val < 1.0:
+                    pred_val = max(self.topic_manager.topics.get(topic, {}).get("heat", 0.0), 100.0)
+                target_heats[topic] = pred_val
+                mode_log[topic] = "PREDICT"
+
+        total_heat = sum(target_heats.values())
         self.phase = self._determine_phase(total_heat)
 
         posts_last_step = [p for p in self.posts if p.time_step == self.t - 1]
@@ -494,14 +515,21 @@ class SocialEnv:
             for p in posts_last_step
         ]
 
-        # --- 核心：按话题拆分目标量并强制执行（精英制，限发言人数） ---
+        # --- 按话题拆分目标量并强制执行（精英制，限发言人数） ---
         total_weight_ratio = sum(getattr(a, "weight_ratio", 1.0) for a in self.agents.values()) or 1.0
         MAX_POSTS_PER_TOPIC = 3
-        for topic, target_heat in topic_heats.items():
+        for topic, target_heat in target_heats.items():
             if target_heat < (self.data_scale * 0.0001):
                 continue
-            num_speakers = min(MAX_POSTS_PER_TOPIC, len(self.agents))
+            # 动态确定人数
+            num_speakers = 1
+            if target_heat > (self.data_scale * 0.1):
+                num_speakers = 2
+            if target_heat > (self.data_scale * 0.3):
+                num_speakers = 3
+            num_speakers = min(num_speakers, MAX_POSTS_PER_TOPIC, len(self.agents))
             quota_per_speaker = target_heat / max(num_speakers, 1)
+
             candidates = list(self.agents.keys())
             weights = [getattr(self.agents[n], "weight_ratio", 1.0) for n in candidates]
             w_sum = sum(weights)

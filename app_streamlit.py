@@ -194,10 +194,11 @@ def main():
     use_default_real = st.sidebar.checkbox("使用默认真实数据（最新训练集）", value=True)
     real_heat_scale = 1.0
     initial_heats: Dict[str, float] = {}
+    real_heat_trajectory: Dict[str, List[float]] = {}
 
     if st.button("开始模拟"):
         st.info("正在创建环境并运行，请稍候...")
-        # 读取真实数据并推断 scale/初始热度
+        # 读取真实数据并推断 scale/初始热度/轨迹
         real_df = None
         if real_file:
             try:
@@ -209,13 +210,27 @@ def main():
             real_df = pd.read_csv(DEFAULT_REAL_DATA_PATH)
 
         if real_df is not None and "heat" in real_df.columns:
-            real_heat_scale = float(real_df["heat"].max())
+            cols = set(real_df.columns)
+            # 针对选择的话题计算量级，不存在的直接忽略
+            df_candidates = real_df
+            if "topic" in cols and topics:
+                df_candidates = real_df[real_df["topic"].isin(topics)]
+                if df_candidates.empty:
+                    df_candidates = real_df  # 兜底
+            real_heat_scale = float(df_candidates["heat"].max())
             st.success(f"检测到真实数据量级 (Scale): {real_heat_scale:,.0f}")
-            if {"topic", "timestamp", "heat"} <= set(real_df.columns):
+            if {"topic", "timestamp", "heat"} <= cols:
                 df_sorted = real_df.sort_values("timestamp")
-                for tp in df_sorted["topic"].unique():
-                    first_row = df_sorted[df_sorted["topic"] == tp].iloc[0]
-                    initial_heats[tp] = float(first_row["heat"])
+                # 仅遍历存在于真实数据的所选话题
+                topic_list = topics if topics else df_sorted["topic"].unique()
+                for tp in topic_list:
+                    sub_df = df_sorted[df_sorted["topic"] == tp]
+                    if sub_df.empty:
+                        continue
+                    traj = sub_df["heat"].astype(float).tolist()
+                    if traj:
+                        real_heat_trajectory[tp] = traj
+                        initial_heats[tp] = traj[0]
         else:
             st.warning("未检测到真实数据或缺少 heat 列，使用默认 Scale=1.0")
 
@@ -227,6 +242,7 @@ def main():
             hawkes_params={"heat_scale": real_heat_scale},
             fixed_heat_scale=real_heat_scale,
             initial_topic_heats=initial_heats,
+            real_heat_trajectory=real_heat_trajectory,
         )
         st.success("模拟完成")
 

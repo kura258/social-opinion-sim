@@ -9,6 +9,7 @@ import random
 import networkx as nx
 import numpy as np
 import pandas as pd
+from utils.simulation_core import HeatDither, PIDController
 
 from config.settings import DEFAULT_REAL_DATA_PATH
 from config.personas import PERSONAS
@@ -196,6 +197,11 @@ class SocialEnv:
         }
         # 真实热度轨迹，用于数据制导
         self.real_heat_trajectory = real_heat_trajectory or {}
+        # 抖动与 PID 控制（按话题）
+        self.dithers: Dict[str, HeatDither] = {t: HeatDither(unit_heat=1.0) for t in self._topics}
+        self.pid_ctrls: Dict[str, PIDController] = {t: PIDController(kp=0.2, ki=0.05, kd=0.0) for t in self._topics}
+        self.cum_target: Dict[str, float] = {t: 0.0 for t in self._topics}
+        self.cum_actual: Dict[str, float] = {t: 0.0 for t in self._topics}
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
         # 记录上一轮真实总量（未归一化）
         self._last_step_real_volume: float = 0.0
@@ -490,21 +496,28 @@ class SocialEnv:
             for tp in self._topics:
                 hawkes_preds[tp] = self.topic_manager.get_heat(tp, current_time=self.t)
 
-        # --- 数据制导：决定目标热度 ---
+        # --- 数据制导：决定目标热度，并应用 PID 校正 ---
         target_heats: Dict[str, float] = {}
         mode_log: Dict[str, str] = {}
         for topic in self._topics:
             real_traj = self.real_heat_trajectory.get(topic, [])
             idx = self.t - 1
             if 0 <= idx < len(real_traj):
-                target_heats[topic] = float(real_traj[idx])
+                raw_target = float(real_traj[idx])
                 mode_log[topic] = "GUIDED"
             else:
                 pred_val = hawkes_preds.get(topic, 0.0)
                 if self.t == 1 and pred_val < 1.0:
                     pred_val = max(self.topic_manager.topics.get(topic, {}).get("heat", 0.0), 100.0)
-                target_heats[topic] = pred_val
+                raw_target = pred_val
                 mode_log[topic] = "PREDICT"
+
+            # PID 修正基于累计量
+            self.cum_target[topic] = self.cum_target.get(topic, 0.0) + raw_target
+            ctrl = self.pid_ctrls.get(topic)
+            correction = ctrl.compute(self.cum_target[topic], self.cum_actual.get(topic, 0.0)) if ctrl else 0.0
+            corrected = max(0.0, raw_target + correction)
+            target_heats[topic] = corrected
 
         total_heat = sum(target_heats.values())
         self.phase = self._determine_phase(total_heat)
@@ -519,15 +532,20 @@ class SocialEnv:
         total_weight_ratio = sum(getattr(a, "weight_ratio", 1.0) for a in self.agents.values()) or 1.0
         MAX_POSTS_PER_TOPIC = 3
         for topic, target_heat in target_heats.items():
-            if target_heat < (self.data_scale * 0.0001):
+            if target_heat <= 1e-6:
+                if self.topic_manager:
+                    self.topic_manager.topics[topic]["heat"] = 0.0
                 continue
-            # 动态确定人数
+            # 动态确定人数（至少 1 人），结合抖动量化
             num_speakers = 1
             if target_heat > (self.data_scale * 0.1):
                 num_speakers = 2
             if target_heat > (self.data_scale * 0.3):
                 num_speakers = 3
-            num_speakers = min(num_speakers, MAX_POSTS_PER_TOPIC, len(self.agents))
+            dither = self.dithers.get(topic)
+            discrete_actions = dither.quantize(target_heat) if dither else num_speakers
+            discrete_actions = max(discrete_actions, 1)
+            num_speakers = min(discrete_actions, MAX_POSTS_PER_TOPIC, len(self.agents))
             quota_per_speaker = target_heat / max(num_speakers, 1)
 
             candidates = list(self.agents.keys())
@@ -576,5 +594,6 @@ class SocialEnv:
                     )
                     self._agent_last_action[name] = self.t
                     new_posts.append(self.posts[-1])
+                    self.cum_actual[topic] = self.cum_actual.get(topic, 0.0) + quota_per_speaker
 
         return new_posts

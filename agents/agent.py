@@ -2,12 +2,53 @@
 from __future__ import annotations
 
 from typing import Dict, Any, List, Optional
+import math
 
 import random
 import numpy as np
 
 from config.styles import STYLE_GUIDE
 from .memory import MemoryStream
+
+# Role-level parameter priors (means). Std is applied when sampling.
+ROLE_PARAM_DISTRIBUTIONS: Dict[str, Dict[str, float]] = {
+    "Crowd": {
+        "base_activity": 0.2,
+        "sensitivity_reward": 0.6,
+        "sensitivity_risk": 0.8,
+        "conformity": 0.8,
+        "reach_factor": 1.0,
+    },
+    "KOL": {
+        "base_activity": 1.2,
+        "sensitivity_reward": 0.9,
+        "sensitivity_risk": 0.6,
+        "conformity": 0.5,
+        "reach_factor": 1.2,
+    },
+    "Troll": {
+        "base_activity": 0.8,
+        "sensitivity_reward": 1.0,
+        "sensitivity_risk": 0.2,
+        "conformity": 0.3,
+        "reach_factor": 1.1,
+    },
+    "BrandOfficial": {
+        "base_activity": 0.3,
+        "sensitivity_reward": 0.5,
+        "sensitivity_risk": 1.2,
+        "conformity": 0.6,
+        "reach_factor": 0.9,
+    },
+    # Alias for generic official role name.
+    "Official": {
+        "base_activity": 0.3,
+        "sensitivity_reward": 0.5,
+        "sensitivity_risk": 1.2,
+        "conformity": 0.6,
+        "reach_factor": 0.9,
+    },
+}
 
 
 class Agent:
@@ -28,6 +69,7 @@ class Agent:
         llm_client,
         topics: Optional[List[str]] = None,
         attention_weights: Optional[Dict[str, float]] = None,
+        params_vector: Optional[Dict[str, float]] = None,
     ):
         """
         :param name: Agent 名字（如 "BrandOfficial", "AngryUser1"）
@@ -58,6 +100,7 @@ class Agent:
             "kol": 0.7,
             "rumor": 0.5,
         }
+        self.params = self._init_role_params(params_vector)
 
     def _init_attention_weights(
         self, provided_weights: Optional[Dict[str, float]]
@@ -83,6 +126,37 @@ class Agent:
             uniform = 1.0 / len(self.topics)
             return {topic: uniform for topic in self.topics}
         return {topic: max(w, 0.0) / total for topic, w in weights.items()}
+
+    def _init_role_params(self, override: Optional[Dict[str, float]]) -> Dict[str, float]:
+        """
+        Initialize behavioral parameters by role-level distributions; allow overrides.
+        """
+        if override:
+            return {
+                k: float(np.clip(v, 0.0, 2.0))
+                for k, v in override.items()
+            }
+
+        dist = ROLE_PARAM_DISTRIBUTIONS.get(self.role) or ROLE_PARAM_DISTRIBUTIONS.get("Crowd", {})
+        sampled = {}
+        for key, mean in dist.items():
+            if key.endswith("_std"):
+                continue
+            std = dist.get(f"{key}_std", 0.1)
+            val = np.random.normal(loc=mean, scale=std)
+            sampled[key] = float(np.clip(val, 0.0, 2.0))
+
+        # Ensure all expected keys exist with fallbacks
+        defaults = {
+            "base_activity": 0.5,
+            "sensitivity_reward": 0.5,
+            "sensitivity_risk": 0.5,
+            "conformity": 0.5,
+            "reach_factor": 1.0,
+        }
+        for k, v in defaults.items():
+            sampled.setdefault(k, v)
+        return sampled
 
     def update_attention(self, new_attention_weights: Dict[str, float]):
         """
@@ -369,6 +443,103 @@ class Agent:
                 }
 
         return action
+
+    # ------------------------------------------------------------------
+    # Field-based propensity (for expected matching)
+    # ------------------------------------------------------------------
+    def calculate_raw_propensity(self, fields) -> float:
+        """
+        Compute unnormalized posting propensity given environment fields.
+        propensity = exp(base + beta_R * R - beta_M * M + beta_C * V)
+        """
+        base = self.params.get("base_activity", 0.0)
+        beta_r = self.params.get("sensitivity_reward", 1.0)
+        beta_m = self.params.get("sensitivity_risk", 1.0)
+        beta_c = self.params.get("conformity", 0.0)
+
+        V = getattr(fields, "V", 0.0) or 0.0
+        R = getattr(fields, "R", 0.0) or 0.0
+        M = getattr(fields, "M", 0.0) or 0.0
+
+        logit = base + beta_r * R - beta_m * M + beta_c * V
+        try:
+            return float(math.exp(logit))
+        except OverflowError:
+            return float("inf")
+
+    # ------------------------------------------------------------------
+    # Tiered gating for API-efficient decisions
+    # ------------------------------------------------------------------
+    def decide_action_probabilistic(self, t: int, fields, observed_posts: List[Dict[str, Any]], environment=None):
+        """
+        Two-step decision:
+        1) Exposure gate -> 2) Action activation -> 3) Tiered brain/reflex.
+        Returns None for Tier 0 (no action).
+        """
+        if fields is None:
+            return None
+
+        V = getattr(fields, "V", 0.0) or 0.0
+        M = getattr(fields, "M", 0.0) or 0.0
+        R = getattr(fields, "R", 0.0) or 0.0
+        global_scale = getattr(fields, "global_scale", 0.0) or 0.0
+
+        reach_factor = self.params.get("reach_factor", 1.0)
+        prob_exposed = 1.0 - math.exp(-reach_factor * V)
+        if random.random() > prob_exposed:
+            return None
+
+        raw_propensity = 0.0
+        if hasattr(self, "calculate_raw_propensity"):
+            try:
+                raw_propensity = float(self.calculate_raw_propensity(fields))
+            except Exception:
+                raw_propensity = 0.0
+        final_prob = 1.0 - math.exp(-raw_propensity * global_scale)
+        if random.random() > final_prob:
+            return None
+
+        is_high_stakes = (V > 0.7) or (M > 0.5) or (self.role in ("KOL", "BrandOfficial", "Official"))
+        env_context = {
+            "fields": fields,
+            "global_tension": V,
+            "visibility": V,
+            "reward": R,
+            "moderation": M,
+            "phase": getattr(environment, "phase", None),
+        }
+
+        if is_high_stakes:
+            try:
+                return self.decide_social_action(
+                    t, observed_posts, environment=environment, env_context=env_context
+                )
+            except Exception:
+                return None
+
+        return self._generate_template_action(observed_posts, fields)
+
+    def _generate_template_action(self, observed_posts: List[Dict[str, Any]], fields) -> Dict[str, Any]:
+        """
+        Cheap reflex action without LLM usage.
+        """
+        templates = [
+            "Interesting...",
+            "Noted.",
+            "Hmm, let's see where this goes.",
+            "Keeping an eye on this.",
+        ]
+        topic = None
+        if observed_posts:
+            topic = observed_posts[-1].get("topic")
+
+        return {
+            "action": "post",
+            "post_text": random.choice(templates),
+            "sentiment": "NEUTRAL",
+            "target_post_id": None,
+            "topic": topic,
+        }
 
     def _calculate_reflex_action(self, post, env_context):
         """

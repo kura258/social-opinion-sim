@@ -5,11 +5,22 @@
 
 import argparse
 import numpy as np
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+import pandas as pd
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Dict
+from pathlib import Path
 from scipy.optimize import minimize
 
 from utils.data_loader import load_all_datasets
 from utils.spread_model import HawkesPredictor
+from config.settings import DEFAULT_REAL_DATA_PATH, DEFAULT_TOPICS
+from agents.agent import ROLE_PARAM_DISTRIBUTIONS
+from env.social_env import SocialEnv
+from simulate import (
+    build_agents,
+    build_graph,
+    inject_initial_rumor,
+    BEST_HAWKES_PARAMS,
+)
 
 
 def parse_args():
@@ -343,6 +354,174 @@ def fit_hawkes_params_global(
         "init_points": init_points,
     }
     return np.array(best.x, dtype=float), float(best.fun), debug_info
+
+
+# ---------------------------------------------------------------------------
+# Agent-parameter calibration via CMA-ES (expected matching to real curves)
+# ---------------------------------------------------------------------------
+
+_CALIBRATION_ROLES = ["Crowd", "KOL", "Troll", "BrandOfficial"]
+_CALIBRATION_KEYS = ["base_activity", "sensitivity_reward", "sensitivity_risk", "conformity"]
+
+
+class FakeLLM:
+    """Cheap stub to bypass real LLM calls during calibration."""
+
+    def chat(self, system: str, user: str, **kwargs):
+        import json
+
+        return json.dumps(
+            {
+                "action": "post",
+                "post_text": "占位自动生成",
+                "sentiment": "NEUTRAL",
+                "target_post_id": None,
+                "topic": None,
+            }
+        )
+
+    def chat_thinking(self, *args, **kwargs):
+        return self.chat("", "")
+
+
+def _update_role_params_from_vector(vec: np.ndarray) -> None:
+    """Map flattened means/stds into ROLE_PARAM_DISTRIBUTIONS (with clipping)."""
+    num_keys = len(_CALIBRATION_KEYS)
+    num_roles = len(_CALIBRATION_ROLES)
+    expected = num_keys * num_roles * 2
+    if vec.shape[0] < expected:
+        raise ValueError(f"params_vector length {vec.shape[0]} < expected {expected}")
+    means = vec[: num_keys * num_roles]
+    stds = vec[num_keys * num_roles : expected]
+    for i, role in enumerate(_CALIBRATION_ROLES):
+        dist: Dict[str, float] = ROLE_PARAM_DISTRIBUTIONS.get(role, {})
+        for j, key in enumerate(_CALIBRATION_KEYS):
+            idx = i * num_keys + j
+            dist[key] = float(np.clip(means[idx], 0.0, 2.0))
+            dist[f"{key}_std"] = float(np.clip(abs(stds[idx]), 0.05, 2.0))
+        ROLE_PARAM_DISTRIBUTIONS[role] = dist
+
+
+def _initial_param_vector() -> np.ndarray:
+    means: List[float] = []
+    stds: List[float] = []
+    for role in _CALIBRATION_ROLES:
+        dist = ROLE_PARAM_DISTRIBUTIONS.get(role, {})
+        for key in _CALIBRATION_KEYS:
+            means.append(float(dist.get(key, 0.5)))
+            stds.append(float(dist.get(f"{key}_std", 0.1)))
+    return np.array(means + stds, dtype=float)
+
+
+def _load_real_series(path: Path, topics: List[str], max_steps: int) -> Dict[str, List[float]]:
+    if not path.exists():
+        return {t: [] for t in topics}
+    df = pd.read_csv(path)
+    out: Dict[str, List[float]] = {t: [] for t in topics}
+    for t in topics:
+        sub = df[df["topic"] == t].sort_values("timestamp")
+        heats = sub["heat"].astype(float).tolist()[:max_steps]
+        out[t] = heats
+    return out
+
+
+def _run_simulation(topics: List[str], params_vector: np.ndarray, steps: int = 350, seed: int = 123):
+    np.random.seed(seed)
+    _update_role_params_from_vector(params_vector)
+
+    llm = FakeLLM()
+    agents = build_agents(llm, topics=topics)
+    G = build_graph(agents.keys())
+    env = SocialEnv(
+        agents,
+        G,
+        topics=topics,
+        hawkes_params=BEST_HAWKES_PARAMS,
+        llm_client=llm,
+        fixed_heat_scale=None,
+        initial_topic_heats=None,
+        real_heat_trajectory=None,
+    )
+
+    # Seed a rumor per topic as in simulate.py
+    seed_volume = 0.0
+    for tp in topics:
+        inject_initial_rumor(env, topic=tp)
+        seed_volume += 1.0
+    env._last_step_real_volume = seed_volume
+    env._update_hawkes_state(seed_volume / max(getattr(env, "data_scale", 1.0), 1.0))
+
+    heat_history: List[Dict[str, float]] = []
+    for _ in range(1, steps + 1):
+        env.step(pr_strategy=None, request_delay=0.0)
+        if env.topic_manager:
+            snap = {"time": env.t}
+            for topic in env.topic_manager.topics:
+                snap[topic] = env.topic_manager.get_heat(topic)
+            heat_history.append(snap)
+
+    sim_series: Dict[str, List[float]] = {t: [] for t in topics}
+    for snap in heat_history:
+        for t in topics:
+            sim_series[t].append(snap.get(t, 0.0))
+    return sim_series
+
+
+def simulation_loss(
+    params_vector: np.ndarray,
+    topics: Optional[List[str]] = None,
+    real_series: Optional[Dict[str, List[float]]] = None,
+    steps: int = 350,
+) -> float:
+    topics = topics or list(DEFAULT_TOPICS)
+    real_series = real_series or _load_real_series(Path(DEFAULT_REAL_DATA_PATH), topics, steps)
+    sim_series = _run_simulation(topics, params_vector, steps=steps)
+
+    losses = []
+    for t in topics:
+        sim = np.array(sim_series.get(t, []), dtype=float)
+        real = np.array(real_series.get(t, []), dtype=float)
+        L = min(len(sim), len(real))
+        if L == 0:
+            losses.append(1e3)
+            continue
+        sim = sim[:L]
+        real = real[:L]
+        mape = compute_mape(real, sim)
+        penalty = 0.5 * abs(np.std(sim) - np.std(real))
+        losses.append(mape + penalty)
+    return float(np.mean(losses))
+
+
+def calibrate(
+    real_data_path: Path = DEFAULT_REAL_DATA_PATH,
+    steps: int = 350,
+    seed: Optional[int] = None,
+    maxiter: int = 50,
+):
+    """
+    Calibrate ROLE_PARAM_DISTRIBUTIONS with CMA-ES to match real heat curves.
+    """
+    try:
+        import cma
+    except ImportError as e:  # pragma: no cover
+        raise ImportError("Please install cma: pip install cma") from e
+
+    topics = list(DEFAULT_TOPICS)
+    real_series = _load_real_series(Path(real_data_path), topics, steps)
+    x0 = _initial_param_vector()
+    es = cma.CMAEvolutionStrategy(x0, 0.2, {"maxiter": maxiter, "seed": seed})
+    while not es.stop():
+        xs = es.ask()
+        losses = [simulation_loss(np.array(x), topics=topics, real_series=real_series, steps=steps) for x in xs]
+        es.tell(xs, losses)
+        es.disp()
+
+    res = es.result  # type: ignore[attr-defined]
+    print("\n[CMA-ES] Best loss:", res.fbest)
+    print("[CMA-ES] Best parameters:", res.xbest)
+    _update_role_params_from_vector(np.array(res.xbest, dtype=float))
+    return res
 
 
 def main():

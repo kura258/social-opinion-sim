@@ -9,7 +9,6 @@ import random
 import networkx as nx
 import numpy as np
 import pandas as pd
-from utils.simulation_core import HeatDither, PIDController
 
 from config.settings import DEFAULT_REAL_DATA_PATH
 from config.personas import PERSONAS
@@ -25,6 +24,59 @@ class Post:
     time_step: int
     target_post_id: Optional[int] = None
     topic: Optional[str] = None
+
+
+@dataclass
+class EnvFields:
+    """
+    Encapsulated environment signals broadcast to agents at each step.
+    """
+    t: int
+    V: float  # Visibility (0-1)
+    R: float  # Reward potential (>0)
+    M: float  # Risk / moderation pressure (0-1)
+    global_scale: float  # Normalization factor for small sample sizes
+
+
+class FieldGenerator:
+    """
+    Maps Hawkes intensity and sentiment into broadcastable environment fields.
+    """
+
+    def __init__(self, heat_scale: float = 100.0):
+        self.heat_scale = max(heat_scale, 1e-6)
+        self.current_time = 0
+
+    def compute_fields(self, hawkes_intensity: float, sentiment_score: float) -> EnvFields:
+        """
+        Convert Hawkes intensity into visibility/reward/risk fields.
+        """
+        # Visibility: normalize intensity and squeeze into [0,1] via sigmoid
+        norm_intensity = (hawkes_intensity / self.heat_scale - 0.5) * 5.0
+        visibility = 1.0 / (1.0 + math.exp(-norm_intensity))
+
+        # Reward potential scales with visibility
+        reward = visibility * 1.5
+
+        # Risk rises when visibility or sentiment are extreme
+        risk = 0.0
+        if visibility > 0.8:
+            risk += (visibility - 0.8) / 0.2
+        sentiment_abs = abs(sentiment_score)
+        if sentiment_abs > 0.8:
+            risk += (sentiment_abs - 0.8) / 0.2
+        risk = min(max(risk, 0.0), 1.0)
+
+        # Smaller intensity relative to scale => smaller normalization factor
+        global_scale = min(1.0, max(hawkes_intensity / self.heat_scale, 0.0))
+
+        return EnvFields(
+            t=self.current_time,
+            V=visibility,
+            R=reward,
+            M=risk,
+            global_scale=global_scale,
+        )
 
 
 class TopicManager:
@@ -187,21 +239,8 @@ class SocialEnv:
         self.topic_backgrounds: Dict[str, str] = {}
         for t in self._topics:
             self.topic_backgrounds[t] = generate_topic_background(t, self.llm_client) if llm_client else f"关于 {t} 的讨论"
-        # 角色分配占比（用于每个话题的配额拆分）
-        self.role_distribution = {
-            "Crowd": 0.85,
-            "Defender": 0.08,
-            "Troll": 0.04,
-            "KOL": 0.02,
-            "BrandOfficial": 0.01,
-        }
         # 真实热度轨迹，用于数据制导
         self.real_heat_trajectory = real_heat_trajectory or {}
-        # 抖动与 PID 控制（按话题）
-        self.dithers: Dict[str, HeatDither] = {t: HeatDither(unit_heat=1.0) for t in self._topics}
-        self.pid_ctrls: Dict[str, PIDController] = {t: PIDController(kp=0.2, ki=0.05, kd=0.0) for t in self._topics}
-        self.cum_target: Dict[str, float] = {t: 0.0 for t in self._topics}
-        self.cum_actual: Dict[str, float] = {t: 0.0 for t in self._topics}
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
         # 记录上一轮真实总量（未归一化）
         self._last_step_real_volume: float = 0.0
@@ -218,6 +257,7 @@ class SocialEnv:
         self.current_intensity = 0.0
         self.phase = "Incubation"
         self.official_has_spoken = False
+        self.field_generator = FieldGenerator(heat_scale=params.get("heat_scale", 100.0))
     def reset(self):
         self.posts = []
         self.t = 0
@@ -231,6 +271,7 @@ class SocialEnv:
         self.current_intensity = 0.0
         self.phase = "Incubation"
         self.official_has_spoken = False
+        self.field_generator = FieldGenerator(heat_scale=self.data_scale or 100.0)
 
     def _compute_reach(self, author: str) -> int:
         """简单地以关注入度作为传播影响力近似。"""
@@ -251,6 +292,19 @@ class SocialEnv:
             + self.params["mu_slow"] * self.M_slow
         )
         self.current_intensity = intensity
+
+    def _compute_sentiment_score(self, posts: List[Post]) -> float:
+        """
+        Roughly aggregate sentiment into [-1, 1] based on last-step posts.
+        """
+        if not posts:
+            return 0.0
+        mapping = {"POSITIVE": 1.0, "NEGATIVE": -1.0, "NEUTRAL": 0.0}
+        scores = []
+        for p in posts:
+            sentiment = (p.sentiment or "").upper()
+            scores.append(mapping.get(sentiment, 0.0))
+        return sum(scores) / max(len(scores), 1)
 
     def _determine_phase(self, total_heat: float) -> str:
         """
@@ -484,116 +538,110 @@ class SocialEnv:
 
     def step(self, pr_strategy=None, request_delay: float = 0.0):
         """
-        [混合动力调度]
-        有真实数据时用真实热度指挥；无数据时用 Hawkes 惯性预测。
+        Field-based update:
+        1) compute Hawkes-driven visibility/reward/risk fields,
+        2) broadcast EnvFields to all agents,
+        3) collect their voluntary actions (no forced quotas).
         """
         self.t += 1
         new_posts: List[Post] = []
 
-        # --- 内生预测（兜底） ---
-        hawkes_preds: Dict[str, float] = {}
-        if self.topic_manager and self._topics:
-            for tp in self._topics:
-                hawkes_preds[tp] = self.topic_manager.get_heat(tp, current_time=self.t)
-
-        # --- 数据制导：决定目标热度，并应用 PID 校正 ---
-        target_heats: Dict[str, float] = {}
-        mode_log: Dict[str, str] = {}
-        for topic in self._topics:
-            real_traj = self.real_heat_trajectory.get(topic, [])
-            idx = self.t - 1
-            if 0 <= idx < len(real_traj):
-                raw_target = float(real_traj[idx])
-                mode_log[topic] = "GUIDED"
-            else:
-                pred_val = hawkes_preds.get(topic, 0.0)
-                if self.t == 1 and pred_val < 1.0:
-                    pred_val = max(self.topic_manager.topics.get(topic, {}).get("heat", 0.0), 100.0)
-                raw_target = pred_val
-                mode_log[topic] = "PREDICT"
-
-            # PID 修正基于累计量
-            self.cum_target[topic] = self.cum_target.get(topic, 0.0) + raw_target
-            ctrl = self.pid_ctrls.get(topic)
-            correction = ctrl.compute(self.cum_target[topic], self.cum_actual.get(topic, 0.0)) if ctrl else 0.0
-            corrected = max(0.0, raw_target + correction)
-            target_heats[topic] = corrected
-
-        total_heat = sum(target_heats.values())
-        self.phase = self._determine_phase(total_heat)
-
         posts_last_step = [p for p in self.posts if p.time_step == self.t - 1]
         observed = [
-            {"id": p.id, "author": p.author, "text": p.text, "tag": p.tag, "topic": p.topic}
+            {
+                "id": p.id,
+                "author": p.author,
+                "text": p.text,
+                "summary": p.text,
+                "sentiment": p.sentiment,
+                "tag": p.tag,
+                "topic": p.topic,
+            }
             for p in posts_last_step
         ]
+        self._last_step_real_volume = float(len(posts_last_step))
 
-        # --- 按话题拆分目标量并强制执行（精英制，限发言人数） ---
-        total_weight_ratio = sum(getattr(a, "weight_ratio", 1.0) for a in self.agents.values()) or 1.0
-        MAX_POSTS_PER_TOPIC = 3
-        for topic, target_heat in target_heats.items():
-            if target_heat <= 1e-6:
-                if self.topic_manager:
-                    self.topic_manager.topics[topic]["heat"] = 0.0
-                continue
-            # 动态确定人数（至少 1 人），结合抖动量化
-            num_speakers = 1
-            if target_heat > (self.data_scale * 0.1):
-                num_speakers = 2
-            if target_heat > (self.data_scale * 0.3):
-                num_speakers = 3
-            dither = self.dithers.get(topic)
-            discrete_actions = dither.quantize(target_heat) if dither else num_speakers
-            discrete_actions = max(discrete_actions, 1)
-            num_speakers = min(discrete_actions, MAX_POSTS_PER_TOPIC, len(self.agents))
-            quota_per_speaker = target_heat / max(num_speakers, 1)
+        normalized_volume = len(posts_last_step) / max(self.data_scale, 1.0)
+        self._update_hawkes_state(normalized_volume)
 
-            candidates = list(self.agents.keys())
-            weights = [getattr(self.agents[n], "weight_ratio", 1.0) for n in candidates]
-            w_sum = sum(weights)
-            probs = [w / w_sum for w in weights] if w_sum > 0 else None
-            chosen_names = np.random.choice(candidates, size=num_speakers, replace=False, p=probs)
+        topic_heats: Dict[str, float] = {}
+        if self.topic_manager and self._topics:
+            for tp in self._topics:
+                topic_heats[tp] = self.topic_manager.get_heat(tp, current_time=self.t)
+        hawkes_intensity = sum(topic_heats.values()) if topic_heats else self.current_intensity
+        self.current_intensity = hawkes_intensity
 
-            for name in chosen_names:
-                agent = self.agents[name]
-                ctx = {
-                    "time": self.t,
-                    "phase": self.phase,
-                    "topic_bg": self.topic_backgrounds.get(topic, f"关于 {topic} 的热议"),
-                    "tension": min(target_heat / max(self.data_scale, 1.0), 1.0),
-                }
-                topic_related_posts = [
-                    p for p in self.posts if p.topic == topic and p.time_step >= self.t - 5
-                ]
-                obs_for_topic = [
-                    {"id": p.id, "author": p.author, "text": p.text, "topic": p.topic}
-                    for p in topic_related_posts[-3:]
-                ]
+        sentiment_score = self._compute_sentiment_score(posts_last_step)
+        self.field_generator.current_time = self.t
+        env_fields = self.field_generator.compute_fields(hawkes_intensity, sentiment_score)
+        self.phase = self._determine_phase(hawkes_intensity)
 
+        # Expected Matching Normalization: scale individual probabilities so that
+        # the expected number of actions matches Hawkes target.
+        agent_propensities: Dict[str, float] = {}
+        for name, agent in self.agents.items():
+            prop = 0.0
+            if hasattr(agent, "calculate_raw_propensity"):
+                try:
+                    prop = float(agent.calculate_raw_propensity(env_fields))
+                except Exception:
+                    prop = 0.0
+            agent_propensities[name] = max(prop, 0.0)
+        total_propensity = sum(agent_propensities.values())
+        delta_t = 1.0
+        target_actions = max(hawkes_intensity * delta_t, 0.0)
+        global_scale = (target_actions / total_propensity) if total_propensity > 0 else 0.0
+        env_fields.global_scale = global_scale
+
+        env_context = {
+            "fields": env_fields,
+            "global_tension": env_fields.V,
+            "visibility": env_fields.V,
+            "reward": env_fields.R,
+            "moderation": env_fields.M,
+            "global_scale": env_fields.global_scale,
+            "topic_heats": topic_heats,
+            "phase": self.phase,
+        }
+
+        for name, agent in self.agents.items():
+            if request_delay > 0:
+                time.sleep(request_delay)
+
+            try:
+                action = agent.decide_social_action(
+                    self.t, observed, environment=self, env_context=env_context
+                )
+            except Exception:
                 action = None
-                if hasattr(agent, "force_action_on_topic"):
-                    try:
-                        action = agent.force_action_on_topic(topic, ctx, obs_for_topic, quota_per_speaker)
-                    except Exception:
-                        action = None
 
-                if action and action.get("action") in ["post", "retweet"]:
-                    act_type = action.get("action")
-                    sentiment = action.get("sentiment", "NEUTRAL")
-                    tag = action.get("tag", "user" if act_type == "post" else "retweet")
-                    post_text = action.get("post_text", action.get("text", ""))
-                    target_id = action.get("target_post_id")
-                    self._add_post(
-                        author=name,
-                        text=post_text,
-                        sentiment=sentiment,
-                        tag=tag,
-                        target_post_id=target_id,
-                        topic=topic,
-                        count=quota_per_speaker,
-                    )
-                    self._agent_last_action[name] = self.t
-                    new_posts.append(self.posts[-1])
-                    self.cum_actual[topic] = self.cum_actual.get(topic, 0.0) + quota_per_speaker
+            if not action:
+                continue
+
+            act_type = action.get("action") or action.get("type")
+            if act_type == "silent":
+                continue
+            if act_type == "post":
+                self._add_post(
+                    author=name,
+                    text=action.get("post_text", action.get("text", "")),
+                    sentiment=action.get("sentiment", "NEUTRAL"),
+                    tag=action.get("tag", "user"),
+                    topic=action.get("topic"),
+                )
+                self._agent_last_action[name] = self.t
+                new_posts.append(self.posts[-1])
+            elif act_type == "retweet":
+                target_id = action.get("target_post_id")
+                self._add_post(
+                    author=name,
+                    text=action.get("post_text", action.get("text", "")),
+                    sentiment=action.get("sentiment", "NEUTRAL"),
+                    tag="retweet",
+                    target_post_id=target_id,
+                    topic=action.get("topic"),
+                )
+                self._agent_last_action[name] = self.t
+                new_posts.append(self.posts[-1])
 
         return new_posts

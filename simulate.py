@@ -148,8 +148,8 @@ def simulate_steps(
     steps = []
     heat_history = []
     for _ in range(1, T + 1):
-        new_posts = env.step(pr_strategy=None, request_delay=request_delay)
-        steps.append(new_posts)
+        actions = env.step(pr_strategy=None, request_delay=request_delay)
+        steps.append(actions)
         if env.topic_manager:
             snapshot = {"time": env.t}
             for topic in env.topic_manager.topics:

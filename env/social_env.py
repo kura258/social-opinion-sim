@@ -451,15 +451,15 @@ class SocialEnv:
                 decision = None
             if not decision:
                 continue
-            act_type = decision.get("action") or decision.get("action_type") or "silent"
-            actions.append(
-                AgentAction(
-                    agent_id=name,
-                    action_type=act_type,
-                    content=decision.get("post_text", decision.get("content", "")) or "",
-                    topic=decision.get("topic") or "",
-                    timestamp=self.t,
+            act_type = decision.action_type if hasattr(decision, "action_type") else "silent"
+            if act_type in ("post", "retweet"):
+                self._add_post(
+                    author=getattr(decision, "agent_id", name),
+                    text=getattr(decision, "content", ""),
+                    sentiment="NEUTRAL",
+                    tag="retweet" if act_type == "retweet" else "user",
+                    topic=getattr(decision, "topic", None),
                 )
-            )
+            actions.append(decision)
 
         return actions

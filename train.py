@@ -560,69 +560,8 @@ def calibrate_agents(
 
 
 def main():
-    args = parse_args()
-    datasets = load_all_datasets(
-        args.data_dir,
-        random_test=args.random_test,
-        seed=args.seed,
-        normalize=True,
-    )
-    print(f"共加载 {len(datasets)} 个事件，用于全局优化")
-    scales = [ev.get("scale", 1.0) for ev in datasets]
-    if any(s != 1.0 for s in scales):
-        print(f"已按事件最大绝对值归一化，scale 范围: min={min(scales):.4f}, max={max(scales):.4f}")
-
-    bounds = [
-        (1e-6, 500.0),   # mu_fast
-        (1e-6, 500.0),   # mu_slow
-        (1e-6, 100.0),      # H_base
-        (0.5, 5.0),      # lambda_fast
-        (0.01, 2.0),     # lambda_slow
-    ]
-
-    init_guesses = [
-        np.array([5.0, 2.0, 5.0, 3.5, 0.3]),
-        np.array([3.0, 1.0, 10.0, 4.0, 0.5]),
-        np.array([2.0, 2.0, 20.0, 2.5, 0.4]),
-        np.array([1.0, 3.0, 30.0, 3.0, 0.2]),
-        np.array([0.8, 0.8, 50.0, 2.0, 0.1]),
-    ]
-
-    if args.use_global_init:
-        cma_x0 = init_guesses[0]
-        best_params, best_loss, _ = fit_hawkes_params_global(
-            datasets,
-            bounds=bounds,
-            cma_x0=cma_x0,
-            sigma0=args.cma_sigma0,
-            popsize=args.cma_popsize,
-            cma_maxiter=args.cma_maxiter,
-            n_starts=args.global_n_starts,
-            perturb_scale=args.perturb_scale,
-            lbfgs_maxiter=args.lbfgs_maxiter,
-            seed=args.seed,
-        )
-    else:
-        best_params, best_loss = fit_with_init_guesses(
-            datasets,
-            bounds=bounds,
-            init_guesses=init_guesses,
-            lbfgs_maxiter=args.lbfgs_maxiter,
-        )
-
-    print("\nGlobal Optimal Parameters (mu_fast, mu_slow, H_base, lambda_fast, lambda_slow):")
-    print(best_params.tolist())
-    print(f"Train+Val avg MSE (优化目标): {best_loss:.6f}")
-
-    train_mse, train_mape, _ = evaluate_split(best_params, datasets, split="train_val")
-    print(f"Train+Val avg MAPE: {train_mape:.4f}%")
-
-    test_mse, test_mape, per_ds = evaluate_split(best_params, datasets, split="test")
-    print(f"Test avg MSE: {test_mse:.6f}")
-    print(f"Test avg MAPE: {test_mape:.4f}%")
-    print("Per-dataset test MSE / MAPE:")
-    for name, l, mape in sorted(per_ds):
-        print(f"  {name}: MSE={l:.6f}, MAPE={mape:.4f}%")
+    # Legacy Hawkes tuning entry is deprecated; CMA-ES calibration is exposed via calibrate_agents().
+    pass
 
 
 if __name__ == "__main__":

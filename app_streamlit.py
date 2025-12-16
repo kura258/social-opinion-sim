@@ -39,23 +39,23 @@ def collect_agent_timeline(steps: List[List], agents) -> pd.DataFrame:
     agent_names = list(agents.keys())
     for t_idx, posts in enumerate(steps, start=1):
         for name in agent_names:
-            agent_posts = [p for p in posts if p.author == name]
+            agent_posts = [p for p in posts if getattr(p, "agent_id", None) == name]
             if agent_posts:
                 for p in agent_posts:
                     rows.append({
                         "time": t_idx,
                         "agent": name,
-                        "action": "post" if p.tag != "retweet" else "retweet",
-                        "sentiment": p.sentiment,
-                        "topic": p.topic or "未标注",
-                        "text": p.text,
+                        "action": p.action_type if hasattr(p, "action_type") else "unknown",
+                        "sentiment": "N/A",
+                        "topic": getattr(p, "topic", None) or "未标注",
+                        "text": getattr(p, "content", ""),
                     })
             else:
                 rows.append({
                     "time": t_idx,
                     "agent": name,
                     "action": "silent",
-                    "sentiment": "NEUTRAL",
+                    "sentiment": "N/A",
                     "topic": "无",
                     "text": "",
                 })
@@ -260,11 +260,11 @@ def main():
             with st.expander(f"时间步 {t_idx} ({len(posts)} 条)"):
                 if posts:
                     rows = [{
-                        "作者": p.author,
-                        "情绪": p.sentiment,
-                        "话题": p.topic or "未标注",
-                        "标签": p.tag,
-                        "内容": p.text,
+                        "作者": getattr(p, "agent_id", "未知"),
+                        "情绪": "N/A",
+                        "话题": getattr(p, "topic", None) or "未标注",
+                        "标签": getattr(p, "action_type", "未知"),
+                        "内容": getattr(p, "content", ""),
                     } for p in posts]
                     st.table(pd.DataFrame(rows))
                 else:

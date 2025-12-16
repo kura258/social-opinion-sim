@@ -425,7 +425,7 @@ class SocialEnv:
         # 5. 异步批处理
         async def _run_async_batch():
             env_ctx_for_llm = {
-                "topic_heats": {k: round(v, 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
+                "topic_heats": {k: round(v.get("heat", 0.0), 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
                 "phase": self.phase,
                 "global_tension": env_fields.risk,
                 "visibility": env_fields.visibility,

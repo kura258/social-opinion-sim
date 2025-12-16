@@ -235,6 +235,20 @@ def main():
         else:
             st.warning("未检测到真实数据或缺少 heat 列，使用默认 Scale=1.0")
 
+        # ==================== 量级对齐 ====================
+        if real_df is not None and "heat" in real_df.columns:
+            df_candidates = real_df[real_df["topic"].isin(topics)] if topics else real_df
+            if df_candidates.empty:
+                df_candidates = real_df
+            real_heat_scale = float(df_candidates["heat"].max())
+        else:
+            real_heat_scale = 100.0
+
+        final_pop_scale = population_scale_input
+        if population_scale_input == 10000.0 and real_heat_scale > 20000:
+            st.warning(f"检测到默认人口系数(1w)与真实量级({real_heat_scale:,.0f})差距过大，已自动对齐。")
+            final_pop_scale = real_heat_scale
+
         env, steps, heat_history, emergent_heat_history = simulate_steps(
             T=T,
             seed=base_seed,
@@ -244,7 +258,7 @@ def main():
             fixed_heat_scale=real_heat_scale,
             initial_topic_heats=initial_heats,
             real_heat_trajectory=real_heat_trajectory,
-            population_scale=population_scale_input,
+            population_scale=final_pop_scale,
         )
         st.success("模拟完成")
 

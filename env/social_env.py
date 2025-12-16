@@ -395,28 +395,37 @@ class SocialEnv:
 
     def step(self, pr_strategy=None, request_delay: float = 0.0) -> List[AgentAction]:
         """
-        Concurrent batch mode: no quotas; all agents participate via BatchActionProcessor calling the LLM.
+        Expected-matching batch mode: compute global_scale from Hawkes intensity, then run batch LLM and probabilistic gate.
         """
         self.t += 1
+
+        # 1. 准备数据
         last_posts = [p for p in self.posts if p.time_step == self.t - 1]
         observed = [{"author": p.author, "text": p.text} for p in last_posts[-10:]]
 
+        # 2. 获取 Hawkes 目标热度
         if self.topic_manager and self._topics:
-            current_heat = sum(self.topic_manager.get_heat(tp, self.t) for tp in self._topics)
+            current_heat_raw = sum(self.topic_manager.get_heat(tp, self.t) for tp in self._topics)
         else:
-            self._update_hawkes_no_topic(len(last_posts))
-            current_heat = self.current_intensity
+            current_heat_raw = self.current_intensity
 
         sentiment_score = self._compute_sentiment_score(last_posts)
-        self.field_generator.current_time = self.t
-        env_fields = self.field_generator.compute_fields(current_heat, sentiment_score)
-        self.phase = self._determine_phase(current_heat)
 
+        # 3. 计算总意愿（简化为人数）
+        env_fields_pre = self.field_generator.compute_fields(current_heat_raw, sentiment_score)
         active_agents = list(self.agents.values())
+        total_raw_propensity = float(len(active_agents)) if active_agents else 0.0
 
+        # 4. 动态缩放因子：按归一化热度映射到 [0,1]
+        norm_intensity = min(1.0, max(current_heat_raw / max(self.data_scale, 1.0), 0.0))
+        env_fields = self.field_generator.compute_fields(current_heat_raw, sentiment_score)
+        env_fields.global_scale = norm_intensity
+        self.phase = self._determine_phase(current_heat_raw)
+
+        # 5. 异步批处理
         async def _run_async_batch():
             env_ctx_for_llm = {
-                "topic_heats": {k: round(v.get("heat", 0.0), 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
+                "topic_heats": {k: round(v, 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
                 "phase": self.phase,
                 "global_tension": env_fields.risk,
                 "visibility": env_fields.visibility,
@@ -432,9 +441,17 @@ class SocialEnv:
             loop = asyncio.get_event_loop()
             action_map = loop.run_until_complete(_run_async_batch())
 
+        # 6. 处理结果并概率门控
         actions: List[AgentAction] = []
         for agent in active_agents:
             res = action_map.get(agent.name, {"action": "silent"})
+            should_act = True
+            if res.get("action") in ["post", "retweet"]:
+                if random.random() > env_fields.global_scale:
+                    should_act = False
+            if not should_act:
+                res["action"] = "silent"
+
             final_act = agent.apply_batch_result(res, self.t)
             if final_act.get("action_type") in ("post", "retweet"):
                 action_obj = AgentAction(

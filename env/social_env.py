@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 import math
@@ -13,6 +14,7 @@ import pandas as pd
 from config.settings import DEFAULT_REAL_DATA_PATH
 from config.personas import PERSONAS
 from utils.topic_helper import generate_topic_background
+from agents.batch_processor import BatchActionProcessor
 
 
 @dataclass
@@ -275,6 +277,8 @@ class SocialEnv:
         self.phase = "Incubation"
         self.official_has_spoken = False
         self.field_generator = FieldGenerator(heat_scale=params.get("heat_scale", 100.0))
+        self.batch_processor = BatchActionProcessor(self.llm_client)
+
     def reset(self):
         self.posts = []
         self.t = 0
@@ -309,6 +313,11 @@ class SocialEnv:
             + self.params["mu_slow"] * self.M_slow
         )
         self.current_intensity = intensity
+
+    def _update_hawkes_no_topic(self, new_posts_count: int) -> None:
+        """Fallback Hawkes update when no topic manager is present."""
+        normalized = new_posts_count / max(self.data_scale, 1.0)
+        self._update_hawkes_state(normalized)
 
     def _compute_sentiment_score(self, posts: List[Post]) -> float:
         """
@@ -384,82 +393,63 @@ class SocialEnv:
         except Exception:
             return 1.0
 
-    def step(self, pr_strategy=None, request_delay: float = 0.0):
+    def step(self, pr_strategy=None, request_delay: float = 0.0) -> List[AgentAction]:
         """
-        Field update with expected-matching normalization:
-        Pass 1: compute total propensity; Pass 2: scale and sample actions.
+        å¹¶å‘æ‰¹å¤„ç†ç‰ˆï¼šä¸é™é…é¢ï¼Œå…¨å‘˜å‚ä¸Žï¼Œé€šè¿‡ BatchActionProcessor ç»Ÿä¸€è°ƒç”¨ LLMã€‚
         """
         self.t += 1
-        posts_last_step = [p for p in self.posts if p.time_step == self.t - 1]
-        observed = [
-            {
-                "id": p.id,
-                "author": p.author,
-                "text": p.text,
-                "summary": p.text,
-                "sentiment": p.sentiment,
-                "tag": p.tag,
-                "topic": p.topic,
-            }
-            for p in posts_last_step
-        ]
-        self._last_step_real_volume = float(len(posts_last_step))
+        last_posts = [p for p in self.posts if p.time_step == self.t - 1]
+        observed = [{"author": p.author, "text": p.text} for p in last_posts[-10:]]
 
-        normalized_volume = len(posts_last_step) / max(self.data_scale, 1.0)
-        self._update_hawkes_state(normalized_volume)
-
-        topic_heats: Dict[str, float] = {}
         if self.topic_manager and self._topics:
-            for tp in self._topics:
-                topic_heats[tp] = self.topic_manager.get_heat(tp, current_time=self.t)
-        hawkes_intensity = sum(topic_heats.values()) if topic_heats else self.current_intensity
-        self.current_intensity = hawkes_intensity
+            current_heat = sum(self.topic_manager.get_heat(tp, self.t) for tp in self._topics)
+        else:
+            self._update_hawkes_no_topic(len(last_posts))
+            current_heat = self.current_intensity
 
-        sentiment_score = self._compute_sentiment_score(posts_last_step)
+        sentiment_score = self._compute_sentiment_score(last_posts)
         self.field_generator.current_time = self.t
-        traces = {"trend_rank": 0, "velocity": 0.0}
-        env_fields = self.field_generator.compute_fields(hawkes_intensity, sentiment_score, traces)
-        self.phase = self._determine_phase(hawkes_intensity)
+        env_fields = self.field_generator.compute_fields(current_heat, sentiment_score)
+        self.phase = self._determine_phase(current_heat)
 
-        # Pass 1: gather propensities
-        agent_propensities: Dict[str, float] = {}
-        for name, agent in self.agents.items():
-            prop = 0.0
-            if hasattr(agent, "calculate_raw_propensity"):
-                try:
-                    prop = float(agent.calculate_raw_propensity(env_fields))
-                except Exception:
-                    prop = 0.0
-            agent_propensities[name] = max(prop, 0.0)
+        active_agents = list(self.agents.values())
 
-        total_propensity = sum(agent_propensities.values())
-        delta_t = 1.0
-        target_count = max(hawkes_intensity * delta_t, 0.0)
-        global_scale = (target_count / total_propensity) if total_propensity > 0 else 0.0
-        env_fields.global_scale = global_scale
+        async def _run_async_batch():
+            env_ctx_for_llm = {
+                "topic_heats": {k: round(v.get("heat", 0.0), 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
+                "phase": self.phase,
+                "global_tension": env_fields.risk,
+                "visibility": env_fields.visibility,
+            }
+            actions_future = self.batch_processor.run_batch(active_agents, env_ctx_for_llm, observed)
+            maint_tasks = [ag.check_memory_maintenance() for ag in active_agents]
+            results = await asyncio.gather(actions_future, *maint_tasks)
+            return results[0]
 
-        # Pass 2: sample actions probabilistically
+        try:
+            action_map = asyncio.run(_run_async_batch())
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            action_map = loop.run_until_complete(_run_async_batch())
+
         actions: List[AgentAction] = []
-        for name, agent in self.agents.items():
-            if request_delay > 0:
-                time.sleep(request_delay)
-            try:
-                decision = agent.decide_action_probabilistic(
-                    self.t, env_fields, observed_posts=observed, environment=self
+        for agent in active_agents:
+            res = action_map.get(agent.name, {"action": "silent"})
+            final_act = agent.apply_batch_result(res, self.t)
+            if final_act.get("action_type") in ("post", "retweet"):
+                action_obj = AgentAction(
+                    agent_id=agent.name,
+                    action_type=final_act["action_type"],
+                    content=final_act.get("content", ""),
+                    topic=final_act.get("topic"),
+                    timestamp=self.t,
                 )
-            except Exception:
-                decision = None
-            if not decision:
-                continue
-            act_type = decision.action_type if hasattr(decision, "action_type") else "silent"
-            if act_type in ("post", "retweet"):
+                actions.append(action_obj)
                 self._add_post(
-                    author=getattr(decision, "agent_id", name),
-                    text=getattr(decision, "content", ""),
+                    author=action_obj.agent_id,
+                    text=action_obj.content,
                     sentiment="NEUTRAL",
-                    tag="retweet" if act_type == "retweet" else "user",
-                    topic=getattr(decision, "topic", None),
+                    tag="user",
+                    topic=action_obj.topic,
                 )
-            actions.append(decision)
-
         return actions

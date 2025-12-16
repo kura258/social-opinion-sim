@@ -2,6 +2,8 @@
 
 import os
 import time
+import asyncio
+from functools import partial
 from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
@@ -125,3 +127,11 @@ class LLMClient:
             {"role": "user", "content": user_prompt},
         ]
         return self._request_chat(messages=messages, enable_thinking=True, temperature=temperature)
+
+    async def chat_async(self, system_prompt: str, user_prompt: str, temperature: float = 0.7) -> str:
+        """
+        异步封装：若底层不支持 async，则通过线程池将同步 chat 转为非阻塞。
+        """
+        loop = asyncio.get_running_loop()
+        func = partial(self.chat, system_prompt, user_prompt, temperature=temperature)
+        return await loop.run_in_executor(None, func)

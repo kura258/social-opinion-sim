@@ -110,9 +110,10 @@ def simulate_steps(
     fixed_heat_scale: Optional[float] = None,
     initial_topic_heats: Optional[dict] = None,
     real_heat_trajectory: Optional[dict] = None,
+    population_scale: float = 5000.0,
 ):
     """
-    运行多时间步模拟，返回环境、每步新增帖子列表、以及话题热度快照。
+    运行多时间步模拟，返回环境、每步新增动作列表、Hawkes 热度快照与 LLM 涌现热度。
     """
     random.seed(seed)
     if not topics:
@@ -147,6 +148,7 @@ def simulate_steps(
 
     steps = []
     heat_history = []
+    emergent_heat_history = []
     for _ in range(1, T + 1):
         actions = env.step(pr_strategy=None, request_delay=request_delay)
         steps.append(actions)
@@ -155,7 +157,18 @@ def simulate_steps(
             for topic in env.topic_manager.topics:
                 snapshot[topic] = env.topic_manager.get_heat(topic)
             heat_history.append(snapshot)
-    return env, steps, heat_history
+        current_step_counts = {t: 0 for t in topics} if topics else {}
+        for act in actions:
+            if hasattr(act, "topic") and act.topic and act.topic in current_step_counts:
+                current_step_counts[act.topic] += 1
+        emergent_snapshot = {"time": env.t}
+        agent_count = len(env.agents)
+        if topics and agent_count > 0:
+            for topic in topics:
+                activity_rate = current_step_counts.get(topic, 0) / agent_count
+                emergent_snapshot[topic] = activity_rate * population_scale
+        emergent_heat_history.append(emergent_snapshot)
+    return env, steps, heat_history, emergent_heat_history
 
 
 # ---------------------------------------------------------------------
@@ -250,7 +263,7 @@ def run_and_compare(
     """
     topics = topics or DEFAULT_TOPICS
     real_path = real_data_path or DEFAULT_REAL_DATA_PATH
-    env, steps, heat_history = simulate_steps(
+    env, steps, heat_history, emergent_heat_history = simulate_steps(
         T=T,
         seed=seed,
         topics=topics,

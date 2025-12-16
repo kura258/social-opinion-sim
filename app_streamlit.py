@@ -234,7 +234,7 @@ def main():
         else:
             st.warning("未检测到真实数据或缺少 heat 列，使用默认 Scale=1.0")
 
-        env, steps, heat_history = simulate_steps(
+        env, steps, heat_history, emergent_heat_history = simulate_steps(
             T=T,
             seed=base_seed,
             topics=topics,

@@ -1,86 +1,52 @@
-# agents/memory.py
-from __future__ import annotations
-from dataclasses import dataclass, field
+import random
 from typing import List
-from datetime import datetime, timedelta
 
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-
-
-@dataclass
-class MemoryItem:
-    text: str
-    created_at: datetime
-    importance: float
-    embedding: np.ndarray = field(repr=False)
-
-
-class MemoryStream:
-    """
-    精简版 Generative Agents 记忆流：
-    - 全局共享一个 SentenceTransformer 模型，避免重复加载
-    - 支持重要度、时效性加权检索
-    """
-
-    _embed_model = None  # 共享嵌入模型
-
-    def __init__(
-        self,
-        llm_client,
-        reflection_threshold: float = 30.0,
-        recency_half_life_hours: float = 6.0,
-    ):
-        self.llm_client = llm_client
-
-        if MemoryStream._embed_model is None:
-            MemoryStream._embed_model = SentenceTransformer("models/all-MiniLM-L6-v2")
-        self.model = MemoryStream._embed_model
-
-        self.memories: List[MemoryItem] = []
-        self.reflection_threshold = reflection_threshold
-        self.recency_half_life_hours = recency_half_life_hours
-
-    # ---- 基础操作 ----
+class Memory:
+    def __init__(self, agent_name: str, buffer_limit: int = 5):
+        self.agent_name = agent_name
+        self.long_term_summary: str = "暂无过往经历。"
+        self.short_term_buffer: List[str] = []
+        # 随机化阈值（3-7之间），防止所有 Agent 同时触发整理导致流量尖峰
+        self.buffer_limit: int = max(3, buffer_limit + random.randint(-1, 2))
 
     def add(self, text: str):
-        emb = self.model.encode([text])[0]
-        item = MemoryItem(
-            text=text,
-            created_at=datetime.now(),
-            importance=5.0,  # 默认重要度，可在 _score_importance 中评估
-            embedding=emb,
+        self.short_term_buffer.append(text)
+
+    def get_context_for_prompt(self) -> str:
+        """为 Prompt 准备的记忆上下文"""
+        if not self.short_term_buffer:
+            recent = "（无近期动态）"
+        else:
+            recent = "\n".join([f"- {m}" for m in self.short_term_buffer])
+        
+        return (
+            f"【长期记忆摘要】：{self.long_term_summary}\n"
+            f"【近期短期记忆】：\n{recent}"
         )
-        self.memories.append(item)
 
-    def retrieve(self, query: str, k: int = 5) -> List[MemoryItem]:
-        if not self.memories:
-            return []
-        query_emb = self.model.encode([query])[0]
-        scores = []
-        for m in self.memories:
-            sim = cosine_similarity([query_emb], [m.embedding])[0][0]
-            recency = self._recency_weight(m.created_at)
-            score = sim * 0.7 + recency * 0.3
-            scores.append(score)
-        top_indices = np.argsort(scores)[::-1][:k]
-        return [self.memories[i] for i in top_indices]
+    def needs_consolidation(self) -> bool:
+        return len(self.short_term_buffer) >= self.buffer_limit
 
-    # ---- 反思与重要度 ----
+    async def consolidate(self, llm_client):
+        """调用 LLM 压缩记忆"""
+        if not self.short_term_buffer:
+            return
 
-    def maybe_reflect(self):
-        """
-        简化的反思：当记忆数量或重要度累积超过阈值时触发，示例中仅重置计数。
-        """
-        if len(self.memories) >= self.reflection_threshold:
-            # 这里可以接入 llm_client 做更复杂的总结/抽象
-            self.memories = self.memories[-self.reflection_threshold :]
+        buffer_text = "\n".join(self.short_term_buffer)
+        system_prompt = "你是一个记忆整理助手。请将用户的近期经历整合进长期记忆摘要中。"
+        user_prompt = (
+            f"当前长期记忆：{self.long_term_summary}\n\n"
+            f"新增近期经历：\n{buffer_text}\n\n"
+            f"任务：更新长期记忆。保留关键观点、情感变化和重要事件，去除无关细节。使用第三人称描述 {self.agent_name}。"
+            f"输出控制在 100 字以内。"
+        )
 
-    def _recency_weight(self, created_at: datetime) -> float:
-        """
-        根据时间衰减计算权重（半衰期 recency_half_life_hours）。
-        """
-        hours = (datetime.now() - created_at).total_seconds() / 3600
-        decay = 0.5 ** (hours / self.recency_half_life_hours)
-        return decay
+        try:
+            # 注意：此处假设 llm_client 实现了 chat_async，如未实现请看第四步
+            new_summary = await llm_client.chat_async(system_prompt, user_prompt)
+            self.long_term_summary = new_summary
+            # 保留最后一条以保持连贯性
+            last_item = self.short_term_buffer[-1]
+            self.short_term_buffer = [last_item] 
+        except Exception as e:
+            print(f"[Memory] Consolidation failed for {self.agent_name}: {e}")

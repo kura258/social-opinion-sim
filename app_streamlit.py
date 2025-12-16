@@ -195,6 +195,7 @@ def main():
     real_heat_scale = 1.0
     initial_heats: Dict[str, float] = {}
     real_heat_trajectory: Dict[str, List[float]] = {}
+    population_scale_input = st.sidebar.number_input("人口规模系数", min_value=0.0, value=10000.0, step=1000.0)
 
     if st.button("开始模拟"):
         st.info("正在创建环境并运行，请稍候...")
@@ -243,6 +244,7 @@ def main():
             fixed_heat_scale=real_heat_scale,
             initial_topic_heats=initial_heats,
             real_heat_trajectory=real_heat_trajectory,
+            population_scale=population_scale_input,
         )
         st.success("模拟完成")
 

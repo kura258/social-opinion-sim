@@ -45,9 +45,9 @@ def collect_agent_timeline(steps: List[List], agents) -> pd.DataFrame:
                     rows.append({
                         "time": t_idx,
                         "agent": name,
-                        "action": p.action_type if hasattr(p, "action_type") else "unknown",
+                        "action": getattr(p, "action_type", "unknown"),
                         "sentiment": "N/A",
-                        "topic": getattr(p, "topic", None) or "未标注",
+                        "topic": getattr(p, "topic", "未标注"),
                         "text": getattr(p, "content", ""),
                     })
             else:

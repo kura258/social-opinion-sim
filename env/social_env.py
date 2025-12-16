@@ -395,7 +395,7 @@ class SocialEnv:
 
     def step(self, pr_strategy=None, request_delay: float = 0.0) -> List[AgentAction]:
         """
-        å¹¶å‘æ‰¹å¤„ç†ç‰ˆï¼šä¸é™é…é¢ï¼Œå…¨å‘˜å‚ä¸Žï¼Œé€šè¿‡ BatchActionProcessor ç»Ÿä¸€è°ƒç”¨ LLMã€‚
+        Concurrent batch mode: no quotas; all agents participate via BatchActionProcessor calling the LLM.
         """
         self.t += 1
         last_posts = [p for p in self.posts if p.time_step == self.t - 1]

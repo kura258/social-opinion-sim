@@ -1,55 +1,56 @@
-# 多智能体舆论博弈模拟（话题热度预测版）
+# 多智能体舆论模拟（Hawkes + LLM）
+基于 Hawkes 双衰减核和 20 个人设的舆情演化实验，支持真实热度对齐、前端可视化与全局参数训练。
 
-基于 20 个人设 + Hawkes 双衰减核的舆论演化实验，支持训练、数据制导仿真、前端可视化与真实数据对比。
+## 主要特性
+- Hawkes 驱动的热度演化：`env/social_env.py` 的 `TopicManager` 使用纯 Hawkes 记忆项（双衰减核），按真实量级推断 `heat_scale`，可接入真实热度轨迹做数据制导。
+- 角色画像与风格约束：`config/personas.py` 提供 20 个人设，`config/styles.py` 定义语气/关键词/句式；`agents/agent.py` 将 LLM 输出与快反概率决策结合。
+- 环境场与配额调度：`SocialEnv.step` 将 Hawkes 强度映射为可见度/风险/奖励场，计算角色出场倾向并采样动作，支持强制发声模式。
+- 可视化与对比：`app_streamlit.py` 展示话题曲线、帖子时间线、MAPE/MSE 实时指标；`simulate.py` 的 `run_and_compare` 生成 `simulation_vs_real.png`。
+- 训练与校准：`train.py` 用 CMA-ES + 多起点 L-BFGS-B 拟合全局 Hawkes 参数，并提供基于真实曲线的角色参数校准。
 
-## 近期核心特性
-- **数据制导仿真**：上传/默认 CSV 的真实热度轨迹作为“指挥棒”，按话题刚性配额；缺失时回退 Hawkes 惯性。自动识别量级、初始热度，并同步显示值避免曲线漂移。
-- **Persona 与话题背景**：`config/personas.py` 定义 20 个细粒度画像；`utils/topic_helper.py` 扩展话题背景；Agent 在指定话题上结合背景与“广场声音”发声，减少复读。
-- **离散化与漂移校正**：`utils/simulation_core.py` 提供抖动量化与 PID 校正，解决连续热度到离散动作的能量丢失与累计漂移。
-- **前端实时指标**：Streamlit 顶部实时 MAPE/MSE 数值与折线；按话题热度曲线、帖子列表、行为时间线。
+## 目录与模块
+- `config/settings.py`：默认话题、真实数据路径、Hawkes/LLM 配置加载。
+- `config/personas.py` / `config/styles.py`：角色画像与语言风格。
+- `agents/agent.py`：LLM+概率混合决策、记忆流、强制发声接口；`agents/llm_client.py` 读取 `CLOSEAI_*` 环境变量；`agents/memory.py` 记忆检索。
+- `env/social_env.py`：Hawkes 主题管理、环境场生成、两种步进逻辑（`step_legacy` 为旧版，`step` 为现用）。
+- `simulate.py`：构建代理与关系图，运行多步模拟，并提供真实数据对比与绘图。
+- `app_streamlit.py`：前端交互，支持上传/默认 CSV，动态选话题与种子。
+- `train.py`：全局 Hawkes 参训与角色参数校准。
+- `utils/topic_helper.py`：话题背景生成；`utils/data_loader.py` / `utils/spread_model.py`：训练数据加载与 Hawkes 预测工具。
+- 数据：`dataset_peak350/classified_events_35_2024Q1-Q4_peak350_v2.csv` 为默认真实轨迹回退（可用 `REAL_DATA_PATH` 覆盖），`artifacts/hawkes_params.json` 存储拟合结果。
 
-## 环境准备
+## 安装
 ```bash
 python -m venv venv
-# macOS/Linux: source venv/bin/activate
-# PowerShell: .\venv\Scripts\Activate.ps1
+.\venv\Scripts\Activate.ps1   # PowerShell，其他终端按需调整
 pip install -r requirements.txt
 ```
 
-## 配置与数据
-- 默认话题：`config/settings.py::DEFAULT_TOPICS`
-- 数据目录：`DATA_DIR` 或默认 `datasets_huoju_norm`，不存在则回退 `dataset_peak350`
-- 真实数据：`config.settings.DEFAULT_REAL_DATA_PATH`（含 `classified_events_35_2024Q1-Q4_peak350_v2.csv`）
-- Hawkes 参数：优先 `artifacts/hawkes_params.json`，否则默认值（含 `heat_scale`）
-- LLM：`CLOSEAI_API_KEY/CLOSEAI_BASE_URL/CLOSEAI_MODEL` 可覆盖默认
+## 运行模拟（命令行）
+```bash
+python simulate.py            # 使用默认话题与 Hawkes 参数，生成 simulation_vs_real.png
+```
+- 可通过 `config/settings.py` 修改默认话题/种子/路径，或覆盖 `CLOSEAI_API_KEY`、`REAL_DATA_PATH`、`HAWKES_PARAM_PATH`、`DATA_DIR` 等环境变量。
+
+## 前端可视化
+```bash
+streamlit run app_streamlit.py
+```
+- 可上传自定义 `topic,heat,timestamp` CSV 或使用默认数据；实时展示每话题曲线、帖子时间线、MAPE/MSE。
 
 ## 训练 Hawkes 参数
 ```bash
-python train.py           # 默认 80/10/10 切分，归一化开启
-# CMA-ES + 多起点 L-BFGS-B
+# 直接多起点 L-BFGS-B
+python train.py
+
+# 全局搜索 + 精调
 python train.py --use_global_init --global_n_starts 30 --cma_maxiter 40 \
   --cma_popsize 16 --cma_sigma0 0.3 --perturb_scale 0.15 --lbfgs_maxiter 300
 ```
+训练结果会更新 `artifacts/hawkes_params.json`，供模拟加载。
 
-## 模拟与对比
-```bash
-python simulate.py             # CLI 快速对比，生成 simulation_vs_real.png
-streamlit run app_streamlit.py # 前端交互
-```
-- 前端上传/默认 CSV 后自动识别量级、初始热度、轨迹；话题缺失自动忽略；可自定义话题或用真实数据话题。
-- 仿真按话题精英制配额（每话题最多 3 人），写回真实权重；数据制导时强制同步热度显示，确保曲线与目标对齐。
-
-## 主要模块
-- `config/settings.py`：默认话题/路径/Hawkes/LLM 参数，加载工件
-- `config/personas.py`：20 个画像（权重比 + 人设）
-- `utils/topic_helper.py`：话题背景生成
-- `utils/simulation_core.py`：抖动量化、PID 控制
-- `agents/agent.py`：话题定向发声（背景+广场上下文）
-- `env/social_env.py`：数据制导/预测混合调度、精英配额、状态同步
-- `simulate.py`：支持 `fixed_heat_scale`、初始热度、真实轨迹
-- `app_streamlit.py`：前端交互与实时指标
-- `train.py`：CMA-ES + L-BFGS-B 拟合
-
-## 小贴士
-- 上传的 CSV 建议含 `topic/timestamp/heat`，时间序按行序处理；缺失话题会自动忽略。
-- 若全局预测漂移，可调节 `HeatDither.unit_heat` 或 PID 参数；如需纯预测，可不提供真实轨迹。
+## 关键环境变量
+- `CLOSEAI_API_KEY`（必填）：LLM 调用 Key；`CLOSEAI_BASE_URL`、`CLOSEAI_MODEL` 可选。
+- `REAL_DATA_PATH`：真实热度 CSV 路径，未提供时回退 `dataset_peak350/...csv`。
+- `HAWKES_PARAM_PATH`：训练好的参数文件，未提供时用 `config.settings.DEFAULT_HAWKES_PARAMS`。
+- `DATA_DIR`：训练/加载数据目录，默认 `datasets_huoju_norm`，不存在则回退 `dataset_peak350`。

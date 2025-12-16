@@ -14,6 +14,7 @@ from config.settings import DEFAULT_REAL_DATA_PATH
 from config.personas import PERSONAS
 from utils.topic_helper import generate_topic_background
 
+
 @dataclass
 class Post:
     id: int
@@ -28,14 +29,33 @@ class Post:
 
 @dataclass
 class EnvFields:
-    """
-    Encapsulated environment signals broadcast to agents at each step.
-    """
     t: int
-    V: float  # Visibility (0-1)
-    R: float  # Reward potential (>0)
-    M: float  # Risk / moderation pressure (0-1)
-    global_scale: float  # Normalization factor for small sample sizes
+    visibility: float  # V(t) from Hawkes
+    reward: float      # R(t) derived from V
+    risk: float        # M(t) derived from V/Sentiment
+    global_scale: float  # Normalization for 20-agent variance
+    traces: Dict[str, Any]
+
+    @property
+    def V(self) -> float:
+        return self.visibility
+
+    @property
+    def R(self) -> float:
+        return self.reward
+
+    @property
+    def M(self) -> float:
+        return self.risk
+
+
+@dataclass
+class AgentAction:
+    agent_id: str
+    action_type: str  # "post", "retweet", "silent"
+    content: str
+    topic: str
+    timestamp: int
 
 
 class FieldGenerator:
@@ -47,10 +67,12 @@ class FieldGenerator:
         self.heat_scale = max(heat_scale, 1e-6)
         self.current_time = 0
 
-    def compute_fields(self, hawkes_intensity: float, sentiment_score: float) -> EnvFields:
-        """
-        Convert Hawkes intensity into visibility/reward/risk fields.
-        """
+    def compute_fields(
+        self,
+        hawkes_intensity: float,
+        sentiment: float,
+        current_traces: Optional[Dict[str, Any]] = None,
+    ) -> EnvFields:
         # Visibility: normalize intensity and squeeze into [0,1] via sigmoid
         norm_intensity = (hawkes_intensity / self.heat_scale - 0.5) * 5.0
         visibility = 1.0 / (1.0 + math.exp(-norm_intensity))
@@ -58,24 +80,19 @@ class FieldGenerator:
         # Reward potential scales with visibility
         reward = visibility * 1.5
 
-        # Risk rises when visibility or sentiment are extreme
-        risk = 0.0
-        if visibility > 0.8:
-            risk += (visibility - 0.8) / 0.2
-        sentiment_abs = abs(sentiment_score)
-        if sentiment_abs > 0.8:
-            risk += (sentiment_abs - 0.8) / 0.2
-        risk = min(max(risk, 0.0), 1.0)
+        # Moderation risk: high when visibility is high; sentiment can modulate if desired
+        risk = 1.0 if visibility > 0.8 else 0.0
 
-        # Smaller intensity relative to scale => smaller normalization factor
         global_scale = min(1.0, max(hawkes_intensity / self.heat_scale, 0.0))
+        traces = current_traces or {}
 
         return EnvFields(
             t=self.current_time,
-            V=visibility,
-            R=reward,
-            M=risk,
+            visibility=visibility,
+            reward=reward,
+            risk=risk,
             global_scale=global_scale,
+            traces=traces,
         )
 
 
@@ -538,14 +555,10 @@ class SocialEnv:
 
     def step(self, pr_strategy=None, request_delay: float = 0.0):
         """
-        Field-based update:
-        1) compute Hawkes-driven visibility/reward/risk fields,
-        2) broadcast EnvFields to all agents,
-        3) collect their voluntary actions (no forced quotas).
+        Field update with expected-matching normalization:
+        Pass 1: compute total propensity; Pass 2: scale and sample actions.
         """
         self.t += 1
-        new_posts: List[Post] = []
-
         posts_last_step = [p for p in self.posts if p.time_step == self.t - 1]
         observed = [
             {
@@ -573,11 +586,11 @@ class SocialEnv:
 
         sentiment_score = self._compute_sentiment_score(posts_last_step)
         self.field_generator.current_time = self.t
-        env_fields = self.field_generator.compute_fields(hawkes_intensity, sentiment_score)
+        traces = {"trend_rank": 0, "velocity": 0.0}
+        env_fields = self.field_generator.compute_fields(hawkes_intensity, sentiment_score, traces)
         self.phase = self._determine_phase(hawkes_intensity)
 
-        # Expected Matching Normalization: scale individual probabilities so that
-        # the expected number of actions matches Hawkes target.
+        # Pass 1: gather propensities
         agent_propensities: Dict[str, float] = {}
         for name, agent in self.agents.items():
             prop = 0.0
@@ -587,61 +600,35 @@ class SocialEnv:
                 except Exception:
                     prop = 0.0
             agent_propensities[name] = max(prop, 0.0)
+
         total_propensity = sum(agent_propensities.values())
         delta_t = 1.0
-        target_actions = max(hawkes_intensity * delta_t, 0.0)
-        global_scale = (target_actions / total_propensity) if total_propensity > 0 else 0.0
+        target_count = max(hawkes_intensity * delta_t, 0.0)
+        global_scale = (target_count / total_propensity) if total_propensity > 0 else 0.0
         env_fields.global_scale = global_scale
 
-        env_context = {
-            "fields": env_fields,
-            "global_tension": env_fields.V,
-            "visibility": env_fields.V,
-            "reward": env_fields.R,
-            "moderation": env_fields.M,
-            "global_scale": env_fields.global_scale,
-            "topic_heats": topic_heats,
-            "phase": self.phase,
-        }
-
+        # Pass 2: sample actions probabilistically
+        actions: List[AgentAction] = []
         for name, agent in self.agents.items():
             if request_delay > 0:
                 time.sleep(request_delay)
-
             try:
-                action = agent.decide_social_action(
-                    self.t, observed, environment=self, env_context=env_context
+                decision = agent.decide_action_probabilistic(
+                    self.t, env_fields, observed_posts=observed, environment=self
                 )
             except Exception:
-                action = None
-
-            if not action:
+                decision = None
+            if not decision:
                 continue
-
-            act_type = action.get("action") or action.get("type")
-            if act_type == "silent":
-                continue
-            if act_type == "post":
-                self._add_post(
-                    author=name,
-                    text=action.get("post_text", action.get("text", "")),
-                    sentiment=action.get("sentiment", "NEUTRAL"),
-                    tag=action.get("tag", "user"),
-                    topic=action.get("topic"),
+            act_type = decision.get("action") or decision.get("action_type") or "silent"
+            actions.append(
+                AgentAction(
+                    agent_id=name,
+                    action_type=act_type,
+                    content=decision.get("post_text", decision.get("content", "")) or "",
+                    topic=decision.get("topic") or "",
+                    timestamp=self.t,
                 )
-                self._agent_last_action[name] = self.t
-                new_posts.append(self.posts[-1])
-            elif act_type == "retweet":
-                target_id = action.get("target_post_id")
-                self._add_post(
-                    author=name,
-                    text=action.get("post_text", action.get("text", "")),
-                    sentiment=action.get("sentiment", "NEUTRAL"),
-                    tag="retweet",
-                    target_post_id=target_id,
-                    topic=action.get("topic"),
-                )
-                self._agent_last_action[name] = self.t
-                new_posts.append(self.posts[-1])
+            )
 
-        return new_posts
+        return actions

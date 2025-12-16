@@ -8,47 +8,9 @@ import random
 import numpy as np
 
 from config.styles import STYLE_GUIDE
+from config.personas import ROLE_PARAM_DISTRIBUTIONS
 from .memory import MemoryStream
-
-# Role-level parameter priors (means). Std is applied when sampling.
-ROLE_PARAM_DISTRIBUTIONS: Dict[str, Dict[str, float]] = {
-    "Crowd": {
-        "base_activity": 0.2,
-        "sensitivity_reward": 0.6,
-        "sensitivity_risk": 0.8,
-        "conformity": 0.8,
-        "reach_factor": 1.0,
-    },
-    "KOL": {
-        "base_activity": 1.2,
-        "sensitivity_reward": 0.9,
-        "sensitivity_risk": 0.6,
-        "conformity": 0.5,
-        "reach_factor": 1.2,
-    },
-    "Troll": {
-        "base_activity": 0.8,
-        "sensitivity_reward": 1.0,
-        "sensitivity_risk": 0.2,
-        "conformity": 0.3,
-        "reach_factor": 1.1,
-    },
-    "BrandOfficial": {
-        "base_activity": 0.3,
-        "sensitivity_reward": 0.5,
-        "sensitivity_risk": 1.2,
-        "conformity": 0.6,
-        "reach_factor": 0.9,
-    },
-    # Alias for generic official role name.
-    "Official": {
-        "base_activity": 0.3,
-        "sensitivity_reward": 0.5,
-        "sensitivity_risk": 1.2,
-        "conformity": 0.6,
-        "reach_factor": 0.9,
-    },
-}
+from env.social_env import AgentAction
 
 
 class Agent:
@@ -470,18 +432,26 @@ class Agent:
     # ------------------------------------------------------------------
     # Tiered gating for API-efficient decisions
     # ------------------------------------------------------------------
-    def decide_action_probabilistic(self, t: int, fields, observed_posts: List[Dict[str, Any]], environment=None):
+    def decide_action_probabilistic(
+        self,
+        t: int,
+        fields,
+        observed_posts: List[Dict[str, Any]],
+        environment=None,
+    ):
         """
-        Two-step decision:
-        1) Exposure gate -> 2) Action activation -> 3) Tiered brain/reflex.
-        Returns None for Tier 0 (no action).
+        Tiered gating:
+        - Exposure gate
+        - Activation gate
+        - Tier selection (Brain vs Reflex)
+        Returns AgentAction or None.
         """
         if fields is None:
             return None
 
-        V = getattr(fields, "V", 0.0) or 0.0
-        M = getattr(fields, "M", 0.0) or 0.0
-        R = getattr(fields, "R", 0.0) or 0.0
+        V = getattr(fields, "visibility", getattr(fields, "V", 0.0)) or 0.0
+        M = getattr(fields, "risk", getattr(fields, "M", 0.0)) or 0.0
+        R = getattr(fields, "reward", getattr(fields, "R", 0.0)) or 0.0
         global_scale = getattr(fields, "global_scale", 0.0) or 0.0
 
         reach_factor = self.params.get("reach_factor", 1.0)
@@ -489,17 +459,15 @@ class Agent:
         if random.random() > prob_exposed:
             return None
 
-        raw_propensity = 0.0
-        if hasattr(self, "calculate_raw_propensity"):
-            try:
-                raw_propensity = float(self.calculate_raw_propensity(fields))
-            except Exception:
-                raw_propensity = 0.0
+        try:
+            raw_propensity = float(self.calculate_raw_propensity(fields))
+        except Exception:
+            raw_propensity = 0.0
         final_prob = 1.0 - math.exp(-raw_propensity * global_scale)
         if random.random() > final_prob:
             return None
 
-        is_high_stakes = (V > 0.7) or (M > 0.5) or (self.role in ("KOL", "BrandOfficial", "Official"))
+        is_high_stakes = (V > 0.7) or (self.role in ("KOL", "Official", "BrandOfficial"))
         env_context = {
             "fields": fields,
             "global_tension": V,
@@ -511,13 +479,28 @@ class Agent:
 
         if is_high_stakes:
             try:
-                return self.decide_social_action(
+                decision = self.decide_social_action(
                     t, observed_posts, environment=environment, env_context=env_context
                 )
             except Exception:
-                return None
+                decision = None
+        else:
+            decision = self._generate_template_action(observed_posts, fields)
 
-        return self._generate_template_action(observed_posts, fields)
+        if not decision:
+            return None
+
+        act_type = decision.get("action") or decision.get("action_type") or "silent"
+        content = decision.get("post_text", decision.get("content", "")) or ""
+        topic = decision.get("topic") or ""
+
+        return AgentAction(
+            agent_id=self.name,
+            action_type=act_type,
+            content=content,
+            topic=topic,
+            timestamp=t,
+        )
 
     def _generate_template_action(self, observed_posts: List[Dict[str, Any]], fields) -> Dict[str, Any]:
         """

@@ -427,7 +427,7 @@ def _load_real_series(path: Path, topics: List[str], max_steps: int) -> Dict[str
 
 def _run_simulation(topics: List[str], params_vector: np.ndarray, steps: int = 350, seed: int = 123):
     np.random.seed(seed)
-    _update_role_params_from_vector(params_vector)
+    _update_role_means_from_vector(params_vector)
 
     llm = FakeLLM()
     agents = build_agents(llm, topics=topics)
@@ -469,18 +469,26 @@ def _run_simulation(topics: List[str], params_vector: np.ndarray, steps: int = 3
 
 def simulation_loss(
     params_vector: np.ndarray,
-    topics: Optional[List[str]] = None,
-    real_series: Optional[Dict[str, List[float]]] = None,
+    hawkes_process=None,
+    true_heat_curve: Optional[Dict[str, List[float]]] = None,
     steps: int = 350,
+    topics: Optional[List[str]] = None,
 ) -> float:
+    """
+    1. Update global role distributions from params_vector
+    2. Reset env/agents (fast mode, no real LLM)
+    3. Run simulation
+    4. Compute MAPE + burstiness penalty
+    """
     topics = topics or list(DEFAULT_TOPICS)
-    real_series = real_series or _load_real_series(Path(DEFAULT_REAL_DATA_PATH), topics, steps)
+    true_heat_curve = true_heat_curve or _load_real_series(Path(DEFAULT_REAL_DATA_PATH), topics, steps)
+    _update_role_means_from_vector(params_vector)
     sim_series = _run_simulation(topics, params_vector, steps=steps)
 
     losses = []
     for t in topics:
         sim = np.array(sim_series.get(t, []), dtype=float)
-        real = np.array(real_series.get(t, []), dtype=float)
+        real = np.array(true_heat_curve.get(t, []), dtype=float)
         L = min(len(sim), len(real))
         if L == 0:
             losses.append(1e3)
@@ -493,14 +501,38 @@ def simulation_loss(
     return float(np.mean(losses))
 
 
-def calibrate(
-    real_data_path: Path = DEFAULT_REAL_DATA_PATH,
+def _flatten_role_means() -> np.ndarray:
+    """Flatten current role mean parameters into a vector."""
+    vec: List[float] = []
+    for role in _CALIBRATION_ROLES:
+        dist = ROLE_PARAM_DISTRIBUTIONS.get(role, {})
+        for key in _CALIBRATION_KEYS:
+            vec.append(float(dist.get(key, 0.5)))
+    return np.array(vec, dtype=float)
+
+
+def _update_role_means_from_vector(params_vector: np.ndarray) -> None:
+    """Update ROLE_PARAM_DISTRIBUTIONS means (keeps any existing std entries intact)."""
+    expected = len(_CALIBRATION_ROLES) * len(_CALIBRATION_KEYS)
+    if params_vector.shape[0] < expected:
+        raise ValueError(f"params_vector length {params_vector.shape[0]} < expected {expected}")
+    for i, role in enumerate(_CALIBRATION_ROLES):
+        dist = ROLE_PARAM_DISTRIBUTIONS.get(role, {})
+        for j, key in enumerate(_CALIBRATION_KEYS):
+            idx = i * len(_CALIBRATION_KEYS) + j
+            dist[key] = float(np.clip(params_vector[idx], 0.0, 2.0))
+        ROLE_PARAM_DISTRIBUTIONS[role] = dist
+
+
+def calibrate_agents(
+    hawkes_process=None,
+    true_heat_curve: Optional[Dict[str, List[float]]] = None,
     steps: int = 350,
     seed: Optional[int] = None,
     maxiter: int = 50,
 ):
     """
-    Calibrate ROLE_PARAM_DISTRIBUTIONS with CMA-ES to match real heat curves.
+    CMA-ES loop to tune role means so simulated heat matches true heat.
     """
     try:
         import cma
@@ -508,19 +540,22 @@ def calibrate(
         raise ImportError("Please install cma: pip install cma") from e
 
     topics = list(DEFAULT_TOPICS)
-    real_series = _load_real_series(Path(real_data_path), topics, steps)
-    x0 = _initial_param_vector()
+    true_heat_curve = true_heat_curve or _load_real_series(Path(DEFAULT_REAL_DATA_PATH), topics, steps)
+    x0 = _flatten_role_means()
     es = cma.CMAEvolutionStrategy(x0, 0.2, {"maxiter": maxiter, "seed": seed})
     while not es.stop():
         xs = es.ask()
-        losses = [simulation_loss(np.array(x), topics=topics, real_series=real_series, steps=steps) for x in xs]
+        losses = [
+            simulation_loss(np.array(x), hawkes_process, true_heat_curve, steps=steps, topics=topics)
+            for x in xs
+        ]
         es.tell(xs, losses)
         es.disp()
 
     res = es.result  # type: ignore[attr-defined]
     print("\n[CMA-ES] Best loss:", res.fbest)
     print("[CMA-ES] Best parameters:", res.xbest)
-    _update_role_params_from_vector(np.array(res.xbest, dtype=float))
+    _update_role_means_from_vector(np.array(res.xbest, dtype=float))
     return res
 
 

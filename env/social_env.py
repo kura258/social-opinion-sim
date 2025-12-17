@@ -447,7 +447,13 @@ class SocialEnv:
             res = action_map.get(agent.name, {"action": "silent"})
             should_act = True
             if res.get("action") in ["post", "retweet"]:
-                if random.random() > env_fields.global_scale:
+                base_floor = 0.05
+                agent_name = getattr(agent, "name", "")
+                agent_role = getattr(agent, "role", "")
+                if ("KOL" in agent_name) or ("Official" in agent_name) or (agent_role in ("KOL", "Official", "BrandOfficial")):
+                    base_floor = 0.10
+                effective_prob = max(env_fields.global_scale, base_floor)
+                if random.random() > effective_prob:
                     should_act = False
             if not should_act:
                 res["action"] = "silent"

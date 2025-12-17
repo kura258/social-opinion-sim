@@ -432,6 +432,7 @@ class SocialEnv:
                 "phase": self.phase,
                 "global_tension": env_fields.risk,
                 "visibility": env_fields.visibility,
+                "global_scale": env_fields.global_scale,
             }
             actions_future = self.batch_processor.run_batch(active_agents, env_ctx_for_llm, observed)
             maint_tasks = [ag.check_memory_maintenance() for ag in active_agents]

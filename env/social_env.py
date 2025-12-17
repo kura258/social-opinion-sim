@@ -11,7 +11,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
-from config.settings import DEFAULT_REAL_DATA_PATH
+from config.settings import DEFAULT_REAL_DATA_PATH, load_hawkes_params
 from config.personas import PERSONAS
 from utils.topic_helper import generate_topic_background
 from agents.batch_processor import BatchActionProcessor
@@ -244,8 +244,9 @@ class SocialEnv:
         self.t = 0
         self._next_post_id = 1
         self._topics = list(topics) if topics else []
-        # 统一处理参数，确保 heat_scale 与真实数据量级对齐
-        params = dict(hawkes_params or {})
+        # 统一处理参数：允许前端只传 heat_scale，同时保留其余 Hawkes 参数（mu/H_base/lambda 等）
+        params = load_hawkes_params()
+        params.update(hawkes_params or {})
         inferred_scale = fixed_heat_scale if fixed_heat_scale and fixed_heat_scale > 0 else params.get("heat_scale")
         if not inferred_scale or inferred_scale <= 1.0:
             inferred_scale = self._infer_data_scale(self._topics)

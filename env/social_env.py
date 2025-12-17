@@ -419,8 +419,8 @@ class SocialEnv:
         active_agents = list(self.agents.values())
         total_raw_propensity = float(len(active_agents)) if active_agents else 0.0
 
-        # 4. 动态缩放因子：按归一化热度映射到 [0,1]
-        norm_intensity = min(1.0, max(current_heat_raw / max(self.data_scale, 1.0), 0.0))
+        # 4. 动态缩放因子：只放不缩（不做上限截断），门控时再将概率截断到 1.0
+        norm_intensity = max(current_heat_raw / max(self.data_scale, 1.0), 0.0)
         env_fields = self.field_generator.compute_fields(current_heat_raw, sentiment_score)
         env_fields.global_scale = norm_intensity
         self.phase = self._determine_phase(current_heat_raw)
@@ -456,7 +456,7 @@ class SocialEnv:
                 agent_role = getattr(agent, "role", "")
                 if ("KOL" in agent_name) or ("Official" in agent_name) or (agent_role in ("KOL", "Official", "BrandOfficial")):
                     base_floor = 0.20
-                effective_prob = max(env_fields.global_scale, base_floor)
+                effective_prob = min(1.0, max(env_fields.global_scale, base_floor))
                 if random.random() > effective_prob:
                     should_act = False
             if not should_act:

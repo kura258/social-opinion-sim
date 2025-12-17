@@ -85,6 +85,8 @@ class BatchActionProcessor:
             "3. 【行为阈值】：不是每个人每个时刻都要发言，但也不要全员长期沉默。\n"
             "   - 若环境可见度/紧张度上升，请提高发声比例。\n"
             "   - action 只能是 post / retweet / silent。\n"
+            "   - 若 action 是 post/retweet，必须提供 topic（从该用户的 candidate_topics 中选择）。\n"
+            "   - 尽量保持话题分散：除非某个话题热度显著高，否则不要把所有发声都集中到同一个 topic。\n"
             "4. 风格指令："
         )
         if group_id == "Official":
@@ -110,6 +112,9 @@ class BatchActionProcessor:
         phase = env_context.get("phase")
         target_n = self._desired_active_count(group_id, len(agents_data), visibility, global_scale, phase)
         topic_heats = env_context.get("topic_heats")
+        diversity_hint = ""
+        if isinstance(topic_heats, dict) and len(topic_heats) >= 2 and visibility >= 0.2:
+            diversity_hint = "尽量覆盖至少 2 个不同 topic（在发声用户之间分散）。"
         return (
             f"【环境信息】\n"
             f"舆论阶段：{phase}\n"
@@ -121,6 +126,7 @@ class BatchActionProcessor:
             f"作为以下 {len(agents_data)} 位用户，决定是否发声。\n"
             f"- 本组本轮建议发声人数：约 {target_n} 人（post/retweet），其余为 silent。\n"
             f"- 如果话题没意思可以 silent，但不要所有人都 silent。\n"
+            f"- {diversity_hint}\n"
             f"{agents_json}\n\n"
             "【输出格式】\n"
             "[\n"

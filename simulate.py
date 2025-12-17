@@ -131,6 +131,7 @@ def simulate_steps(
         fixed_heat_scale=fixed_heat_scale,
         initial_topic_heats=initial_topic_heats,
         real_heat_trajectory=real_heat_trajectory,
+        population_scale=population_scale,
     )
 
     # 初始爆料：为每个话题种子一条（若未提供话题，则发一条默认）

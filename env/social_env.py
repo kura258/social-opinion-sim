@@ -235,6 +235,7 @@ class SocialEnv:
         fixed_heat_scale: Optional[float] = None,
         initial_topic_heats: Optional[Dict[str, float]] = None,
         real_heat_trajectory: Optional[Dict[str, List[float]]] = None,
+        population_scale: float = 1.0,
     ):
         self.llm_client = llm_client
         self.agents = agents
@@ -278,6 +279,7 @@ class SocialEnv:
         self.official_has_spoken = False
         self.field_generator = FieldGenerator(heat_scale=params.get("heat_scale", 100.0))
         self.batch_processor = BatchActionProcessor(self.llm_client)
+        self.population_scale = float(population_scale or 1.0)
 
     def reset(self):
         self.posts = []
@@ -443,15 +445,16 @@ class SocialEnv:
 
         # 6. 处理结果并概率门控
         actions: List[AgentAction] = []
+        base_volume = self.population_scale / max(len(active_agents), 1)
         for agent in active_agents:
             res = action_map.get(agent.name, {"action": "silent"})
             should_act = True
             if res.get("action") in ["post", "retweet"]:
-                base_floor = 0.05
+                base_floor = 0.10
                 agent_name = getattr(agent, "name", "")
                 agent_role = getattr(agent, "role", "")
                 if ("KOL" in agent_name) or ("Official" in agent_name) or (agent_role in ("KOL", "Official", "BrandOfficial")):
-                    base_floor = 0.10
+                    base_floor = 0.20
                 effective_prob = max(env_fields.global_scale, base_floor)
                 if random.random() > effective_prob:
                     should_act = False
@@ -468,11 +471,15 @@ class SocialEnv:
                     timestamp=self.t,
                 )
                 actions.append(action_obj)
+                act_volume = base_volume * random.uniform(0.5, 1.5)
+                if ("KOL" in action_obj.agent_id) or ("Official" in action_obj.agent_id) or (getattr(agent, "role", "") in ("KOL", "Official", "BrandOfficial")):
+                    act_volume *= 2.0
                 self._add_post(
                     author=action_obj.agent_id,
                     text=action_obj.content,
                     sentiment="NEUTRAL",
                     tag="user",
                     topic=action_obj.topic,
+                    count=act_volume,
                 )
         return actions

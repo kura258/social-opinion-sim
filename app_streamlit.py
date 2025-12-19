@@ -111,24 +111,6 @@ def compute_metrics(pred_df: pd.DataFrame, real_df: pd.DataFrame, topic_max: pd.
     return overall_mse, overall_mape, per_topic
 
 
-def compute_loss_series(pred_df: pd.DataFrame, real_df: pd.DataFrame, topic_max: pd.Series | None = None):
-    """
-    逐时间步计算累积 MAPE/MSE，用于流式折线展示。
-    """
-    if pred_df.empty or real_df.empty:
-        return pd.DataFrame(columns=["time", "mape", "mse"])
-    times = sorted(set(pred_df["time"]) & set(real_df["time"]))
-    records = []
-    for t in times:
-        sub_pred = pred_df[pred_df["time"] <= t]
-        sub_real = real_df[real_df["time"] <= t]
-        overall_mse, overall_mape, _ = compute_metrics(sub_pred, sub_real, topic_max=topic_max)
-        if overall_mse is None:
-            continue
-        records.append({"time": t, "mape": overall_mape, "mse": overall_mse})
-    return pd.DataFrame(records)
-
-
 def plot_metrics(per_topic: pd.DataFrame):
     if per_topic is None or per_topic.empty:
         return None
@@ -156,12 +138,6 @@ def main():
     st.set_page_config(page_title="话题热度模拟", layout="wide")
     st.title("多智能体舆论模拟：话题与热度可视化")
     # 顶部 Loss 流式展示
-    loss_placeholder = st.empty()
-    loss_placeholder.markdown("**当前 Loss** | MAPE: _待计算_ | MSE: _待计算_")
-    loss_chart_placeholder = st.empty()
-    loss_time_series_placeholder = st.empty()
-    if "loss_history" not in st.session_state:
-        st.session_state["loss_history"] = []
 
     # 控制面板
     st.sidebar.header("模拟参数")
@@ -270,33 +246,15 @@ def main():
         else:
             st.info("当前未配置话题或无热度数据。")
 
-        # 时间步帖子展示
-        st.subheader("按时间步的事件内容")
-        for t_idx, posts in enumerate(steps, start=1):
-            with st.expander(f"时间步 {t_idx} ({len(posts)} 条)"):
-                if posts:
-                    rows = [{
-                        "作者": getattr(p, "agent_id", "未知"),
-                        "情绪": "N/A",
-                        "话题": getattr(p, "topic", None) or "未标注",
-                        "标签": getattr(p, "action_type", "未知"),
-                        "内容": getattr(p, "content", ""),
-                    } for p in posts]
-                    st.table(pd.DataFrame(rows))
-                else:
-                    st.write("无新帖子")
-                if delay_sec > 0 and t_idx < len(steps):
-                    time.sleep(delay_sec)
+        # 简化展示：仅总览表 + Agent 时间线
+        st.subheader("全部事件汇总")
+        posts_df = collect_posts_df(env)
+        st.dataframe(posts_df)
 
         # Agent 行为时间线
         st.subheader("Agent 行为时间线")
         agent_timeline = collect_agent_timeline(steps, env.agents)
         st.dataframe(agent_timeline)
-
-        # 汇总所有帖子表
-        st.subheader("全部帖子汇总")
-        posts_df = collect_posts_df(env)
-        st.dataframe(posts_df)
 
         # 真实数据对比（默认加载最新训练集，也可上传覆盖）
         real_df = None
@@ -318,31 +276,15 @@ def main():
                 pred_df = compute_pred_df(heat_history)
                 overall_mse, overall_mape, per_topic = compute_metrics(pred_df, norm_real, topic_max=topic_max)
                 st.subheader("真实数据对比 (MAPE / MSE)")
-                if overall_mse is not None:
-                    # 顶部流式更新 loss
-                    loss_placeholder.markdown(f"**当前 Loss** | MAPE: `{overall_mape:.3f}%` | MSE: `{overall_mse:.6f}`")
-                    # 记录并绘制 Loss 折线
-                    st.session_state["loss_history"].append(
-                        {"run": len(st.session_state["loss_history"]) + 1, "mape": overall_mape, "mse": overall_mse}
-                    )
-                    loss_df = pd.DataFrame(st.session_state["loss_history"]).set_index("run")
-                    loss_chart_placeholder.line_chart(loss_df)
-                    # 逐时间步累积 loss 流式展示
-                    loss_series = compute_loss_series(pred_df, norm_real, topic_max=topic_max)
-                    if not loss_series.empty:
-                        loss_series = loss_series.set_index("time")
-                        loss_time_series_placeholder.line_chart(loss_series)
+                if overall_mse is None:
+                    st.info("无法对齐真实数据，请确认 time/topic 匹配。")
+                else:
                     st.write(f"总体 MAPE: {overall_mape:.3f}%")
                     st.write(f"总体 MSE: {overall_mse:.6f}")
                     st.dataframe(per_topic)
                     fig = plot_metrics(per_topic)
                     if fig:
                         st.pyplot(fig)
-                else:
-                    loss_placeholder.markdown("**当前 Loss** | MAPE: _无法计算_ | MSE: _无法计算_")
-                    st.info("无法对齐真实数据，请确认 time/topic 匹配。")
-        else:
-            loss_placeholder.markdown("**当前 Loss** | MAPE: _等待真实数据_ | MSE: _等待真实数据_")
 
 
 if __name__ == "__main__":

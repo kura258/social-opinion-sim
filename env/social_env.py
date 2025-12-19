@@ -282,7 +282,8 @@ class SocialEnv:
         self.field_generator = FieldGenerator(heat_scale=params.get("heat_scale", 100.0))
         self.batch_processor = BatchActionProcessor(self.llm_client)
         self.population_scale = float(population_scale or 1.0)
-        self.bg_generator = BackgroundTrafficGenerator(peak_time=10, intensity=300)
+        bg_intensity = max(10, int(self.data_scale * 0.05))
+        self.bg_generator = BackgroundTrafficGenerator(peak_time=10, intensity=bg_intensity)
 
     def reset(self):
         self.posts = []
@@ -407,9 +408,9 @@ class SocialEnv:
         bg_count = self.bg_generator.get_noise_volume(self.t)
 
         # 1. data prep
-        last_posts = [p for p in self.posts if p.time_step == self.t - 1]
-        last_posts_map = {p.id: p for p in last_posts}
-        observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in last_posts[-10:]]
+        recent_posts = self.posts[-50:]
+        last_posts_map = {p.id: p for p in recent_posts}
+        observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in recent_posts[-10:]]
 
         # 2. hawkes target heat (inject background first)
         self._update_hawkes_no_topic(bg_count)
@@ -456,7 +457,8 @@ class SocialEnv:
 
         # 6. process results and gate probabilities
         actions: List[AgentAction] = []
-        base_volume = self.population_scale / max(len(active_agents), 1)
+        smart_agent_ratio = 0.5
+        base_volume = (self.population_scale * smart_agent_ratio) / max(len(active_agents), 1)
         for agent in active_agents:
             res = action_map.get(agent.name, {"action": "silent"})
             should_act = True
@@ -480,6 +482,11 @@ class SocialEnv:
                 # 对互动类动作强制使用目标帖子的 topic，避免跨话题串线
                 if final_act.get("action_type") in ("like", "comment", "retweet"):
                     final_act["topic"] = target_topic
+            elif final_act.get("action_type") in ("like", "comment", "retweet"):
+                if final_act.get("action_type") == "retweet":
+                    final_act["action_type"] = "post"
+                else:
+                    final_act["action_type"] = "silent"
             if not final_act.get("topic"):
                 final_act["topic"] = self._topics[0] if self._topics else "未标注"
             if final_act.get("action_type") in ("post", "retweet", "comment", "like"):

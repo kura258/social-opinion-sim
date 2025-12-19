@@ -80,9 +80,23 @@ class Agent:
         if raw_action in ["like", "comment", "retweet"]:
             if observed_posts:
                 target_hint = action_result.get("target_user", "") or ""
-                candidates = [p for p in observed_posts if target_hint and target_hint in str(p.get("author", ""))]
-                target = random.choice(candidates) if candidates else random.choice(observed_posts)
+                preferred_topic = topic if topic else (self.topics[0] if self.topics else None)
+
+                candidates = [
+                    p
+                    for p in observed_posts
+                    if (target_hint and target_hint in str(p.get("author", ""))) and (p.get("topic") == preferred_topic)
+                ]
+                if not candidates and target_hint:
+                    candidates = [p for p in observed_posts if target_hint in str(p.get("author", ""))]
+                if not candidates and preferred_topic:
+                    candidates = [p for p in observed_posts if p.get("topic") == preferred_topic]
+                if not candidates:
+                    candidates = observed_posts
+
+                target = random.choice(candidates)
                 target_post_id = target.get("id")
+                topic = target.get("topic", topic)
                 final_action_type = raw_action
             else:
                 if raw_action == "retweet":

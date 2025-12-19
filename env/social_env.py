@@ -59,6 +59,8 @@ class AgentAction:
     topic: str
     timestamp: int
     target_post_id: Optional[int] = None
+    # 可视化用：如背景流量/系统注入等的“权重/声量”
+    count: Optional[float] = None
 
 
 class FieldGenerator:
@@ -465,12 +467,12 @@ class SocialEnv:
         normalized = new_posts_count / max(self.data_scale, 1.0)
         self._update_hawkes_state(normalized)
 
-    def _distribute_background_to_topics(self, bg_count: int) -> None:
+    def _distribute_background_to_topics(self, bg_count: int) -> Dict[str, float]:
         """
         将背景流量分摊到各话题的 Hawkes 记忆中，避免单话题独占。
         """
         if not self.topic_manager or not self._topics or bg_count <= 0:
-            return
+            return {}
         weights = []
         for tp in self._topics:
             traj = self.real_heat_trajectory.get(tp) or []
@@ -485,17 +487,20 @@ class SocialEnv:
             weights.append(max(w, 0.0) + 1.0)
         total_w = sum(weights) if weights else 0.0
         if total_w <= 0.0:
-            return
+            return {}
 
         alloc = [int(bg_count * w / total_w) for w in weights]
         remainder = bg_count - sum(alloc)
         for i in range(remainder):
             alloc[i % len(alloc)] += 1
 
+        alloc_map: Dict[str, float] = {}
         for tp, c in zip(self._topics, alloc):
             if c <= 0:
                 continue
             self.topic_manager.add_volume(tp, current_time=self.t, reach=0.0, count=float(c))
+            alloc_map[tp] = float(c)
+        return alloc_map
 
     def _compute_sentiment_score(self, posts: List[Post]) -> float:
         """
@@ -659,8 +664,9 @@ class SocialEnv:
         observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in deduped]
 
         # 2. hawkes target heat (inject background first)
+        bg_alloc: Dict[str, float] = {}
         if self.topic_manager and self._topics:
-            self._distribute_background_to_topics(bg_count)
+            bg_alloc = self._distribute_background_to_topics(bg_count)
         else:
             self._update_hawkes_no_topic(bg_count)
         if self.topic_manager and self._topics:
@@ -715,6 +721,18 @@ class SocialEnv:
 
         # 6. process results and gate probabilities
         actions: List[AgentAction] = []
+        # 先把背景流量作为“系统动作”输出（仅用于前端展示，不写入 posts）
+        for tp, c in (bg_alloc or {}).items():
+            actions.append(
+                AgentAction(
+                    agent_id="System_Background",
+                    action_type="background",
+                    content=f"+{int(c)}",
+                    topic=tp,
+                    timestamp=self.t,
+                    count=float(c),
+                )
+            )
         for agent in active_agents:
             res = action_map.get(agent.name, {"action": "silent"})
             should_act = True

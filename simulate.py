@@ -154,6 +154,8 @@ def simulate_steps(
             heat_history.append(snapshot)
         current_step_counts = {t: 0 for t in topics} if topics else {}
         for act in actions:
+            if getattr(act, "action_type", None) in ("background", "seed"):
+                continue
             if hasattr(act, "topic") and act.topic and act.topic in current_step_counts:
                 current_step_counts[act.topic] += 1
         emergent_snapshot = {"time": env.t}

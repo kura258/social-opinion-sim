@@ -96,6 +96,19 @@ def build_topic_feed(steps: List[List], env: SocialEnv, heat_history: List[dict]
     """
     feed: Dict[str, Dict[str, List[dict]]] = {}
     post_lookup = {p.id: p for p in env.posts}
+    # t=0 种子贴（系统注入）：展示为 seed 动作
+    for p in env.posts:
+        if getattr(p, "time_step", None) == 0 and getattr(p, "tag", "") == "official" and getattr(p, "topic", None):
+            tp = p.topic
+            entry = {
+                "time": 0,
+                "agent": getattr(p, "author", "System_Seed"),
+                "action": "seed",
+                "content": getattr(p, "text", ""),
+                "target": "",
+                "count": None,
+            }
+            feed.setdefault(tp, {}).setdefault("seed", []).append(entry)
     for t_idx, acts in enumerate(steps, start=1):
         for act in acts:
             topic = getattr(act, "topic", None)
@@ -107,6 +120,7 @@ def build_topic_feed(steps: List[List], env: SocialEnv, heat_history: List[dict]
                 "action": getattr(act, "action_type", ""),
                 "content": getattr(act, "content", ""),
                 "target": "",
+                "count": getattr(act, "count", None),
             }
             target_post_id = getattr(act, "target_post_id", None)
             if target_post_id and target_post_id in post_lookup:
@@ -307,18 +321,44 @@ def main():
                 st.markdown(f"**{idx}. {tp}** · 热度/计数：{score_val:.2f}" if isinstance(score_val, float) else f"**{idx}. {tp}** · 热度/计数：{score_val}")
                 actions_by_type = topic_feed.get(tp, {})
                 summary_counts = {k: len(v) for k, v in actions_by_type.items()}
-                st.markdown(f"点赞: {summary_counts.get('like',0)}｜评论: {summary_counts.get('comment',0)}｜转发: {summary_counts.get('retweet',0)}｜发帖: {summary_counts.get('post',0)}")
+                bg_total = sum(float(i.get("count") or 0.0) for i in actions_by_type.get("background", []))
+                st.markdown(
+                    "点赞: {like}｜评论: {comment}｜转发: {retweet}｜发帖: {post}｜种子: {seed}｜背景: {bg}".format(
+                        like=summary_counts.get("like", 0),
+                        comment=summary_counts.get("comment", 0),
+                        retweet=summary_counts.get("retweet", 0),
+                        post=summary_counts.get("post", 0),
+                        seed=summary_counts.get("seed", 0),
+                        bg=int(bg_total),
+                    )
+                )
 
-                for label, key in [("发帖", "post"), ("转发", "retweet"), ("评论", "comment"), ("点赞", "like")]:
+                for label, key in [
+                    ("发帖", "post"),
+                    ("转发", "retweet"),
+                    ("评论", "comment"),
+                    ("点赞", "like"),
+                    ("种子", "seed"),
+                    ("背景", "background"),
+                ]:
                     items = actions_by_type.get(key, [])
                     if not items:
                         continue
                     with st.expander(f"{label}（{len(items)}）", expanded=False):
-                        for item in items:
+                        # 避免背景/长序列一次渲染过多
+                        show_items = items
+                        max_show = 30 if key in ("background",) else 80
+                        if len(show_items) > max_show:
+                            show_items = show_items[-max_show:]
+                            st.caption(f"仅显示最近 {max_show} 条（共 {len(items)} 条）")
+                        for item in show_items:
                             target_txt = f" ↪ {item['target']}" if item.get("target") else ""
                             content_txt = item.get("content", "")
+                            extra = ""
+                            if key == "background" and item.get("count") is not None:
+                                extra = f"（+{int(float(item['count']))}）"
                             st.markdown(
-                                f"- t={item['time']:>3}｜{item['agent']} {item['action']}：{content_txt}{target_txt}"
+                                f"- t={item['time']:>3}｜{item['agent']} {item['action']}{extra}：{content_txt}{target_txt}"
                             )
         else:
             st.info("暂无互动记录。")

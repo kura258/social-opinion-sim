@@ -36,7 +36,7 @@ def pick_default_topics(seed: int = DEFAULT_SIM_SEED, k: int = 5) -> List[str]:
     """
     直接使用 DEFAULT_TOPICS，保证确定性。
     """
-    return DEFAULT_TOPICS[: min(k, len(DEFAULT_TOPICS))]
+    return list(DEFAULT_TOPICS)
 
 
 def build_agents(llm: LLMClient, topics: Optional[List[str]] = None) -> Dict[str, Agent]:
@@ -133,19 +133,6 @@ def simulate_steps(
         real_heat_trajectory=real_heat_trajectory,
         population_scale=population_scale,
     )
-
-    # 初始爆料：为每个话题种子一条（若未提供话题，则发一条默认）
-    seed_volume = 0.0
-    if topics:
-        for tp in topics:
-            inject_initial_rumor(env, topic=tp)
-            seed_volume += 1.0
-    else:
-        inject_initial_rumor(env, topic=None)
-        seed_volume += 1.0
-    # 将初始种子量反馈给 Hawkes（归一化），避免首轮强度为 0
-    env._last_step_real_volume = seed_volume
-    env._update_hawkes_state(seed_volume / max(getattr(env, "data_scale", 1.0), 1.0))
 
     steps = []
     heat_history = []

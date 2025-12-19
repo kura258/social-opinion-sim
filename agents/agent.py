@@ -45,6 +45,7 @@ class Agent:
             "candidate_topics": list(self.topics),
             "suggested_topic": suggested_topic,
             "current_state": {"emotion": self.emotion, "confidence": self.social_confidence},
+            "topic_backgrounds": env_context.get("topic_backgrounds", {}),
         }
 
     def apply_batch_result(

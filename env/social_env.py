@@ -155,6 +155,7 @@ class TopicManager:
         hawkes = self.H_base + self.mu_fast * tdata["mem_fast"] + self.mu_slow * tdata["mem_slow"]
         return (base + hawkes) * self.heat_scale
 
+
     def decay_to(self, topic: str, current_time: int) -> None:
         """
         将记忆衰减到当前时间步（即便本步没有新事件），保证 Hawkes 递推的时间一致性。
@@ -284,6 +285,7 @@ class SocialEnv:
         self.population_scale = float(population_scale or 1.0)
         bg_intensity = max(10, int(self.data_scale * 0.05))
         self.bg_generator = BackgroundTrafficGenerator(peak_time=10, intensity=bg_intensity)
+        self._inject_seed_posts()
 
     def reset(self):
         self.posts = []
@@ -299,6 +301,28 @@ class SocialEnv:
         self.phase = "Incubation"
         self.official_has_spoken = False
         self.field_generator = FieldGenerator(heat_scale=self.data_scale or 100.0)
+        self._inject_seed_posts()
+
+    def _inject_seed_posts(self):
+        """
+        在 t=0 注入话题种子贴，确保每个话题有明确的起点。
+        """
+        seed_templates = {
+            "春晚节目": "【央视新闻】#春晚节目# 2025年春晚节目单正式官宣！今年不仅有经典曲目回归，还有多种新形式表演，你最期待哪一个？",
+            "哈工大你玩真的啊": "【校园快报】#哈工大你玩真的啊# 哈工大再次硬核整活，向每位新生发放特别礼包，引发全网热议。",
+            "为啥网上的药比实体药店更便宜": "【健康消费】#为啥网上的药比实体药店更便宜# 有人说是补贴，有人说是渠道差异，你怎么看？",
+            "太空发快递可以当日达了": "【科技速递】#太空发快递可以当日达了# 新一代太空物流方案公布，太空快递或将进入现实。",
+        }
+        for topic in self._topics:
+            content = seed_templates.get(topic, f"【热门话题】关于 #{topic}# 的最新讨论开启了。")
+            self._add_post(
+                author="Official_Media_001",
+                text=content,
+                sentiment="NEUTRAL",
+                tag="official",
+                topic=topic,
+                count=100.0,
+            )
 
     def _compute_reach(self, author: str) -> int:
         """简单地以关注入度作为传播影响力近似。"""
@@ -445,6 +469,7 @@ class SocialEnv:
                 "visibility": env_fields.visibility,
                 "global_scale": env_fields.global_scale,
                 "global_mood": round(avg_emotion, 2),
+                "topic_backgrounds": self.topic_backgrounds,
             }
             actions_future = self.batch_processor.run_batch(active_agents, env_ctx_for_llm, observed)
             maint_tasks = [ag.check_memory_maintenance() for ag in active_agents]

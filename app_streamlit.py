@@ -181,15 +181,14 @@ def main():
     delay_sec = st.sidebar.slider("每步界面延迟（秒）", 0.0, 2.0, 0.2, 0.05)
     request_delay = st.sidebar.slider("API 请求间隔（秒）", 0.0, 2.0, 0.2, 0.05)
 
-    # 默认话题：从 classified_events_35.csv 抽取 5 个，可在前端修改
-    default_topics = pick_default_topics(seed=base_seed, k=5)
-    # 如果用户未手动修改，则每次根据 seed 刷新默认话题
+    # 默认话题：使用数据集的全部 35 个，可在前端修改
+    default_topics = pick_default_topics(seed=base_seed)
     if "topics_input_user_set" not in st.session_state:
         st.session_state["topics_input_user_set"] = False
     if not st.session_state["topics_input_user_set"]:
         st.session_state["topics_input"] = "\n".join(default_topics)
 
-    st.sidebar.markdown(f"**默认话题（前 5）**：{', '.join(default_topics)}")
+    st.sidebar.markdown(f"**默认话题数量：{len(default_topics)} 个**")
     topics_input = st.sidebar.text_area(
         "自定义话题（逗号或换行分隔）",
         st.session_state["topics_input"],

@@ -42,10 +42,15 @@ class Agent:
             "unique_profile": self.profile,
             "memory_context": self.memory.get_context_for_prompt(),
             "observation": obs_summary,
+            "observation_items": [
+                {"id": p.get("id"), "author": p.get("author"), "topic": p.get("topic"), "text": (p.get("text") or "")[:120]}
+                for p in (observed_posts or [])[-10:]
+            ],
             "candidate_topics": list(self.topics),
             "suggested_topic": suggested_topic,
             "current_state": {"emotion": self.emotion, "confidence": self.social_confidence},
             "topic_backgrounds": env_context.get("topic_backgrounds", {}),
+            "cold_topics": env_context.get("cold_topics", []),
         }
 
     def apply_batch_result(
@@ -81,22 +86,36 @@ class Agent:
 
         if raw_action in ["like", "comment", "retweet"]:
             if observed_posts:
+                target_post_id = action_result.get("target_post_id") or action_result.get("target_postId")
                 target_hint = action_result.get("target_user", "") or ""
                 preferred_topic = topic if topic else (self.topics[0] if self.topics else None)
 
-                candidates = [
-                    p
-                    for p in observed_posts
-                    if (target_hint and target_hint in str(p.get("author", ""))) and (p.get("topic") == preferred_topic)
-                ]
-                if not candidates and target_hint:
-                    candidates = [p for p in observed_posts if target_hint in str(p.get("author", ""))]
-                if not candidates and preferred_topic:
-                    candidates = [p for p in observed_posts if p.get("topic") == preferred_topic]
-                if not candidates:
-                    candidates = observed_posts
+                target = None
+                if target_post_id is not None:
+                    try:
+                        target_post_id = int(target_post_id)
+                    except Exception:
+                        target_post_id = None
+                if target_post_id is not None:
+                    for p in observed_posts:
+                        if p.get("id") == target_post_id:
+                            target = p
+                            break
 
-                target = random.choice(candidates)
+                if target is None:
+                    candidates = [
+                        p
+                        for p in observed_posts
+                        if (target_hint and target_hint in str(p.get("author", ""))) and (p.get("topic") == preferred_topic)
+                    ]
+                    if not candidates and target_hint:
+                        candidates = [p for p in observed_posts if target_hint in str(p.get("author", ""))]
+                    if not candidates and preferred_topic:
+                        candidates = [p for p in observed_posts if p.get("topic") == preferred_topic]
+                    if not candidates:
+                        candidates = observed_posts
+                    target = random.choice(candidates)
+
                 target_post_id = target.get("id")
                 topic = target.get("topic", topic)
                 final_action_type = raw_action
@@ -115,6 +134,12 @@ class Agent:
             content = "[Like]"
         elif final_action_type == "silent":
             content = ""
+
+        # 强制 Post 使用 suggested_topic，避免 topic/text 失配（LLM 未给 topic 时也能锁定）
+        if final_action_type == "post":
+            suggested = action_result.get("suggested_topic")
+            if isinstance(suggested, str) and suggested.strip():
+                topic = suggested.strip()
 
         if final_action_type != "silent":
             if (not topic) or (isinstance(topic, str) and topic.strip().lower() in ("null", "none", "")):
@@ -136,7 +161,7 @@ class Agent:
         if not posts:
             return "当前无新消息。"
         recent = posts[-5:]
-        return "; ".join([f"{p['author']}: {p['text'][:30]}..." for p in recent])
+        return "; ".join([f"[{p.get('topic','未标注')}] {p['author']}: {p['text'][:30]}..." for p in recent])
 
     async def check_memory_maintenance(self):
         if self.memory.needs_consolidation():

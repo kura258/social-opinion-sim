@@ -126,8 +126,9 @@ class BatchActionProcessor:
             f"【决策规则】\n"
             f"- 大部分普通用户 (Crowd) 更倾向于 Like 或 Silent。\n"
             f"- 只有 KOL 或情绪极端的 Troll 才频繁 Post/Retweet。\n"
-            f"- 如果选择 Comment/Retweet/Like，请在 thought 中说明是针对谁。\n"
-            f"- 发起 Post 时，内容需贴合 topic_backgrounds 的描述，避免跑题。\n\n"
+            f"- 如果选择 Like/Comment/Retweet：必须从 observation_items 中选择一个 target_post_id，并让 topic 等于该目标帖的 topic。\n"
+            f"- 如果选择 Post：topic 必须等于 suggested_topic，并且内容需贴合 topic_backgrounds[topic] 的描述，避免跑题。\n"
+            f"- 若 cold_topics 非空，请优先补位这些话题（选择其中一个作为 suggested_topic 来发帖/参与讨论），以分散讨论。\n\n"
             f"{agents_json}\n\n"
             "【输出格式 (JSON List)】\n"
             "[\n"
@@ -137,8 +138,9 @@ class BatchActionProcessor:
             '    "emotion_change": 0.1,\n'
             '    "confidence_change": 0.0,\n'
             '    "action": "like",\n'
-            '    "content": "",\n'
-            '    "target_user": "..."\n'
+            '    "topic": "春晚节目",\n'
+            '    "target_post_id": 123,\n'
+            '    "content": ""\n'
             "  }, ...\n"
             "]"
         )

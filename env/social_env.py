@@ -110,6 +110,8 @@ class TopicManager:
         topics: Sequence[str],
         hawkes_params: Optional[Dict[str, float]] = None,
         initial_heats: Optional[Dict[str, float]] = None,
+        base_curve: Optional[Dict[str, List[float]]] = None,
+        base_weight: float = 0.6,
     ):
         params = hawkes_params or {}
         # 强制将基础统计项设为 0，消除模型结构偏差
@@ -118,8 +120,11 @@ class TopicManager:
         self.gamma_r = 0.0
         # 训练集热度量级，严格用于缩放
         self.heat_scale = params.get("heat_scale", 1.0)
+        self.base_curve = base_curve or {}
+        self.base_weight = float(base_weight or 0.0)
         # 双衰减核参数（与训练保持一致）
-        self.H_base = params.get("H_base", 0.0)
+        # 若提供真实曲线作为 base，避免重复叠加常数基线
+        self.H_base = 0.0 if self.base_curve else params.get("H_base", 0.0)
         self.mu_fast = params.get("mu_fast", params.get("mu", 0.5))
         self.mu_slow = params.get("mu_slow", 0.2)
         self.lambda_fast = params.get("lambda_fast", params.get("lambda", 1.0))
@@ -147,7 +152,19 @@ class TopicManager:
             }
 
     def _compute_base(self, topic: str, current_time: int) -> float:
-        return 0.0
+        if self.base_weight <= 0.0:
+            return 0.0
+        traj = self.base_curve.get(topic)
+        if not traj:
+            return 0.0
+        idx = current_time - 1
+        if idx < 0 or idx >= len(traj):
+            return 0.0
+        try:
+            real_heat = float(traj[idx])
+        except Exception:
+            return 0.0
+        return (self.base_weight * max(real_heat, 0.0)) / max(self.heat_scale, 1.0)
 
     def _compute_heat(self, topic: str, current_time: int) -> float:
         tdata = self.topics[topic]
@@ -246,6 +263,8 @@ class SocialEnv:
         self.t = 0
         self._next_post_id = 1
         self._topics = list(topics) if topics else []
+        # 真实热度轨迹，用于数据制导（需在 topic_manager 初始化前可用）
+        self.real_heat_trajectory = real_heat_trajectory or {}
         # 统一处理参数：允许前端只传 heat_scale，同时保留其余 Hawkes 参数（mu/H_base/lambda 等）
         params = load_hawkes_params()
         params.update(hawkes_params or {})
@@ -256,14 +275,20 @@ class SocialEnv:
         self.data_scale = inferred_scale
         self._hawkes_params = params
         self.topic_manager: Optional[TopicManager] = (
-            TopicManager(self._topics, params, initial_topic_heats) if self._topics else None
+            TopicManager(
+                self._topics,
+                params,
+                initial_topic_heats,
+                base_curve=self.real_heat_trajectory,
+                base_weight=0.75,
+            )
+            if self._topics
+            else None
         )
         # 话题背景
         self.topic_backgrounds: Dict[str, str] = {}
         for t in self._topics:
-            self.topic_backgrounds[t] = generate_topic_background(t, self.llm_client) if llm_client else f"关于 {t} 的讨论"
-        # 真实热度轨迹，用于数据制导
-        self.real_heat_trajectory = real_heat_trajectory or {}
+            self.topic_backgrounds[t] = self._build_topic_background(t)
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
         # 记录上一轮真实总量（未归一化）
         self._last_step_real_volume: float = 0.0
@@ -283,7 +308,7 @@ class SocialEnv:
         self.field_generator = FieldGenerator(heat_scale=params.get("heat_scale", 100.0))
         self.batch_processor = BatchActionProcessor(self.llm_client)
         self.population_scale = float(population_scale or 1.0)
-        bg_intensity = max(10, int(self.data_scale * 0.05))
+        bg_intensity = max(10, int(self.data_scale * 0.01))
         self.bg_generator = BackgroundTrafficGenerator(peak_time=10, intensity=bg_intensity)
         self._inject_seed_posts()
 
@@ -292,7 +317,12 @@ class SocialEnv:
         self.t = 0
         self._next_post_id = 1
         if self._topics:
-            self.topic_manager = TopicManager(self._topics, self._hawkes_params)
+            self.topic_manager = TopicManager(
+                self._topics,
+                self._hawkes_params,
+                base_curve=self.real_heat_trajectory,
+                base_weight=0.75,
+            )
         self._agent_last_action = {name: 0 for name in self.agents}
         self._last_step_real_volume = 0.0
         self.M_fast = 0.0
@@ -302,6 +332,21 @@ class SocialEnv:
         self.official_has_spoken = False
         self.field_generator = FieldGenerator(heat_scale=self.data_scale or 100.0)
         self._inject_seed_posts()
+        for t in self._topics:
+            self.topic_backgrounds[t] = self._build_topic_background(t)
+
+    def _build_topic_background(self, topic: str) -> str:
+        """
+        生成更丰富的话题背景，包含名称、内容概述与关键信息点。
+        """
+        base = generate_topic_background(topic, self.llm_client) if self.llm_client else None
+        if base and isinstance(base, str) and base.strip():
+            return base
+        return (
+            f"事件名称：{topic}；"
+            f"内容概述：围绕“{topic}”的最新动态、相关观点与讨论；"
+            "关键信息：时间、地点、涉及人物、争议焦点、潜在影响、舆论态度。"
+        )
 
     def _inject_seed_posts(self):
         """
@@ -321,7 +366,7 @@ class SocialEnv:
                 sentiment="NEUTRAL",
                 tag="official",
                 topic=topic,
-                count=100.0,
+                count=20.0,
             )
 
     def _compute_reach(self, author: str) -> int:
@@ -348,6 +393,39 @@ class SocialEnv:
         """Fallback Hawkes update when no topic manager is present."""
         normalized = new_posts_count / max(self.data_scale, 1.0)
         self._update_hawkes_state(normalized)
+
+    def _distribute_background_to_topics(self, bg_count: int) -> None:
+        """
+        将背景流量分摊到各话题的 Hawkes 记忆中，避免单话题独占。
+        """
+        if not self.topic_manager or not self._topics or bg_count <= 0:
+            return
+        weights = []
+        for tp in self._topics:
+            traj = self.real_heat_trajectory.get(tp) or []
+            idx = self.t - 1
+            if 0 <= idx < len(traj):
+                try:
+                    w = float(traj[idx])
+                except Exception:
+                    w = 0.0
+            else:
+                w = float(self.topic_manager.topics.get(tp, {}).get("heat", 0.0))
+            weights.append(max(w, 0.0) + 1.0)
+        total_w = sum(weights) if weights else 0.0
+        if total_w <= 0.0:
+            return
+
+        alloc = [int(bg_count * w / total_w) for w in weights]
+        remainder = bg_count - sum(alloc)
+        for i in range(remainder):
+            alloc[i % len(alloc)] += 1
+
+        for tp, c in zip(self._topics, alloc):
+            if c <= 0:
+                continue
+            # 使用空内容，仅作为强度事件，不进入 env.posts
+            self.topic_manager.add_post(tp, "", current_time=self.t, reach=0.0, count=float(c))
 
     def _compute_sentiment_score(self, posts: List[Post]) -> float:
         """
@@ -439,7 +517,10 @@ class SocialEnv:
         observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in recent_posts[-10:]]
 
         # 2. hawkes target heat (inject background first)
-        self._update_hawkes_no_topic(bg_count)
+        if self.topic_manager and self._topics:
+            self._distribute_background_to_topics(bg_count)
+        else:
+            self._update_hawkes_no_topic(bg_count)
         if self.topic_manager and self._topics:
             current_heat_raw = sum(self.topic_manager.get_heat(tp, self.t) for tp in self._topics)
         else:
@@ -464,6 +545,10 @@ class SocialEnv:
         async def _run_async_batch():
             env_ctx_for_llm = {
                 "topic_heats": {k: round(v.get("heat", 0.0), 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
+                "cold_topics": sorted(
+                    self.topic_manager.topics.keys(),
+                    key=lambda k: self.topic_manager.topics[k].get("heat", 0.0),
+                )[: max(1, len(self._topics) // 5)] if self.topic_manager else [],
                 "phase": self.phase,
                 "global_tension": env_fields.risk,
                 "visibility": env_fields.visibility,

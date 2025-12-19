@@ -1,4 +1,5 @@
 ﻿import time
+import os
 from typing import List, Optional, Dict
 from pathlib import Path
 
@@ -7,6 +8,8 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 from config.settings import DEFAULT_SIM_SEED
+from config.personas import PERSONAS
+from agents.batch_processor import GROUP_MAPPING
 from simulate import simulate_steps, pick_default_topics, DEFAULT_REAL_DATA_PATH
 from env.social_env import SocialEnv
 
@@ -142,7 +145,7 @@ def build_topic_feed(steps: List[List], env: SocialEnv, heat_history: List[dict]
 def compute_metrics(pred_df: pd.DataFrame, real_df: pd.DataFrame, topic_max: pd.Series | None = None):
     merged = pred_df.merge(real_df, on=["time", "topic"], how="inner")
     if merged.empty:
-        return None, None, None
+        return None, None, None, None
     epsilon = 1e-6
     # 如果做了按 topic 峰值归一化，MAPE 的分母会变得很小（长尾/早期容易“误差爆炸”）
     # 因此采用“过滤版 MAPE”：仅在 heat_real 大于阈值时计入
@@ -209,6 +212,20 @@ def plot_metrics(per_topic: pd.DataFrame):
     return fig
 
 
+def estimate_llm_calls_per_step() -> int:
+    """
+    粗略估算：每个时间步会对每个 group 发起 1 次 LLM 请求。
+    这里用 PERSONAS + GROUP_MAPPING 估算 group 数量。
+    """
+    groups = set()
+    for persona in PERSONAS:
+        name = persona.get("name", "")
+        role = persona.get("role", "")
+        gid = GROUP_MAPPING.get(name, GROUP_MAPPING.get(role, "Default"))
+        groups.add(gid)
+    return max(1, len(groups))
+
+
 def main():
     st.set_page_config(page_title="话题热度模拟", layout="wide")
     st.title("多智能体舆论模拟：话题与热度可视化")
@@ -220,6 +237,36 @@ def main():
     base_seed = st.sidebar.number_input("随机种子", min_value=0, max_value=9999, value=DEFAULT_SIM_SEED)
     delay_sec = st.sidebar.slider("每步界面延迟（秒）", 0.0, 2.0, 0.2, 0.05)
     request_delay = st.sidebar.slider("API 请求间隔（秒）", 0.0, 2.0, 0.2, 0.05)
+
+    st.sidebar.subheader("LLM 费用保护")
+    use_llm = st.sidebar.checkbox("启用 LLM（会产生费用）", value=False)
+    llm_confirm_ok = True
+    llm_budget_ok = True
+    if use_llm:
+        per_step_calls = estimate_llm_calls_per_step()
+        est_calls = int(per_step_calls * int(T))
+        st.sidebar.warning("启用 LLM 会产生费用；关闭浏览器不会停止后台 Streamlit 进程。")
+        st.sidebar.caption(f"预计请求次数（粗略）：每步约 {per_step_calls} 次，总计约 {est_calls} 次。")
+        max_requests = st.sidebar.number_input(
+            "单次运行最大请求次数上限（建议设置）",
+            min_value=0,
+            max_value=200000,
+            value=2000,
+            step=100,
+        )
+        confirm = st.sidebar.text_input("二次确认：输入 CONFIRM 才允许运行", value="", type="password")
+        llm_confirm_ok = confirm.strip().upper() == "CONFIRM"
+        llm_budget_ok = (int(max_requests) <= 0) or (est_calls <= int(max_requests))
+
+        if not os.getenv("CLOSEAI_API_KEY"):
+            st.sidebar.error("未检测到 CLOSEAI_API_KEY：无法启用 LLM。")
+            llm_confirm_ok = False
+
+        if not llm_budget_ok:
+            st.sidebar.error("预计请求次数超过上限，请降低 T 或提高上限。")
+        if not llm_confirm_ok:
+            st.sidebar.info("未确认：输入 CONFIRM 后才能开始模拟。")
+
     st.sidebar.subheader("动力学参数（拟合用）")
     base_weight = st.sidebar.slider("真实曲线引导权重 (base_weight)", 0.0, 1.0, 0.75, 0.05)
     bg_intensity_ratio = st.sidebar.slider("背景流量比例 (bg_intensity_ratio)", 0.0, 0.05, 0.01, 0.001)
@@ -251,6 +298,9 @@ def main():
     real_heat_trajectory: Dict[str, List[float]] = {}
 
     if st.button("开始模拟"):
+        if use_llm and (not llm_confirm_ok or not llm_budget_ok):
+            st.error("LLM 费用保护未通过：请完成二次确认并确保请求上限满足预估。")
+            return
         st.info("正在创建环境并运行，请稍候...")
         # 读取真实数据并推断 scale/初始热度/轨迹
         real_df = None
@@ -310,6 +360,7 @@ def main():
             base_weight=float(base_weight),
             bg_intensity_ratio=float(bg_intensity_ratio),
             volume_factor=float(volume_factor),
+            use_llm=bool(use_llm),
         )
         st.success("模拟完成")
 

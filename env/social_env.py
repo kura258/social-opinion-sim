@@ -140,7 +140,18 @@ class TopicManager:
         for topic in topics:
             start_heat = init_map.get(topic, self.H_base * self.heat_scale)
             norm_heat = start_heat / max(self.heat_scale, 1.0)
-            approx_mem = max(0.0, (norm_heat - self.H_base) / (self.mu_fast + self.mu_slow + 1e-6))
+            mu_sum = self.mu_fast + self.mu_slow + 1e-6
+            # 若使用真实曲线作为 base，初始化记忆应只覆盖“base 之外的残差”，避免双重叠加
+            if self.base_curve and (self.base_curve.get(topic) or []):
+                try:
+                    real0 = float((self.base_curve.get(topic) or [0.0])[0])
+                except Exception:
+                    real0 = 0.0
+                base0_norm = (self.base_weight * max(real0, 0.0)) / max(self.heat_scale, 1.0)
+                residual_norm = max(0.0, norm_heat - base0_norm)
+                approx_mem = max(0.0, residual_norm / mu_sum)
+            else:
+                approx_mem = max(0.0, (norm_heat - self.H_base) / mu_sum)
             self.topics[topic] = {
                 "heat": start_heat,
                 "posts": [],
@@ -181,6 +192,9 @@ class TopicManager:
             return
         tdata = self.topics[topic]
         last_time = tdata["last_time"]
+        if last_time is None:
+            tdata["last_time"] = current_time
+            return
         dt = (current_time - last_time) if last_time is not None else 0
         if dt <= 0:
             return
@@ -222,6 +236,34 @@ class TopicManager:
 
         tdata["heat"] = self._compute_heat(topic, current_time)
 
+    def add_volume(
+        self,
+        topic: str,
+        current_time: int,
+        count: float,
+        reach: float = 0.0,
+    ) -> None:
+        """
+        仅注入强度事件（不保存帖子内容），用于背景流量等“噪声”。
+        """
+        if topic not in self.topics:
+            return
+        if count <= 0:
+            return
+        tdata = self.topics[topic]
+        step_stats = tdata["per_step"].setdefault(current_time, {"V": 0, "C": 0, "R": 0})
+        step_stats["V"] += count
+        step_stats["R"] += reach * count
+        norm_count = count / max(self.heat_scale, 1.0)
+        last_time = tdata["last_time"]
+        dt = (current_time - last_time) if last_time is not None else 0
+        decay_fast = math.exp(-self.lambda_fast * dt) if dt > 0 else 1.0
+        decay_slow = math.exp(-self.lambda_slow * dt) if dt > 0 else 1.0
+        tdata["mem_fast"] = tdata["mem_fast"] * decay_fast + float(norm_count)
+        tdata["mem_slow"] = tdata["mem_slow"] * decay_slow + float(norm_count)
+        tdata["last_time"] = current_time
+        tdata["heat"] = self._compute_heat(topic, current_time)
+
     def get_heat(self, topic: str, current_time: Optional[int] = None) -> float:
         """
         获取当前热度；若提供 current_time，则先衰减至当前时间步后返回。
@@ -255,6 +297,9 @@ class SocialEnv:
         initial_topic_heats: Optional[Dict[str, float]] = None,
         real_heat_trajectory: Optional[Dict[str, List[float]]] = None,
         population_scale: float = 1.0,
+        base_weight: float = 0.75,
+        bg_intensity_ratio: float = 0.01,
+        volume_factor: float = 0.002,
     ):
         self.llm_client = llm_client
         self.agents = agents
@@ -262,9 +307,25 @@ class SocialEnv:
         self.posts: List[Post] = []
         self.t = 0
         self._next_post_id = 1
+        self.seed_post_ids: Dict[str, int] = {}
         self._topics = list(topics) if topics else []
         # 真实热度轨迹，用于数据制导（需在 topic_manager 初始化前可用）
         self.real_heat_trajectory = real_heat_trajectory or {}
+        self._initial_topic_heats = initial_topic_heats or {}
+        self.topic_scales: Dict[str, float] = {}
+        for tp in self._topics:
+            series = self.real_heat_trajectory.get(tp) or []
+            if series:
+                try:
+                    self.topic_scales[tp] = float(max(series))
+                except Exception:
+                    self.topic_scales[tp] = 0.0
+            else:
+                self.topic_scales[tp] = 0.0
+        self.base_weight = float(base_weight or 0.0)
+        self.bg_intensity_ratio = float(bg_intensity_ratio or 0.0)
+        # 动态话语权系数：单次动作贡献约为话题峰值的比例
+        self.volume_factor = float(volume_factor or 0.0)
         # 统一处理参数：允许前端只传 heat_scale，同时保留其余 Hawkes 参数（mu/H_base/lambda 等）
         params = load_hawkes_params()
         params.update(hawkes_params or {})
@@ -278,9 +339,9 @@ class SocialEnv:
             TopicManager(
                 self._topics,
                 params,
-                initial_topic_heats,
+                self._initial_topic_heats,
                 base_curve=self.real_heat_trajectory,
-                base_weight=0.75,
+                base_weight=self.base_weight,
             )
             if self._topics
             else None
@@ -306,9 +367,10 @@ class SocialEnv:
         self.phase = "Incubation"
         self.official_has_spoken = False
         self.field_generator = FieldGenerator(heat_scale=params.get("heat_scale", 100.0))
-        self.batch_processor = BatchActionProcessor(self.llm_client)
+        self.batch_processor = BatchActionProcessor(self.llm_client) if self.llm_client else None
         self.population_scale = float(population_scale or 1.0)
-        bg_intensity = max(10, int(self.data_scale * 0.01))
+        bg_intensity = max(0, int(self.data_scale * self.bg_intensity_ratio))
+        bg_intensity = max(10, bg_intensity) if self.bg_intensity_ratio > 0 else 0
         self.bg_generator = BackgroundTrafficGenerator(peak_time=10, intensity=bg_intensity)
         self._inject_seed_posts()
 
@@ -316,13 +378,19 @@ class SocialEnv:
         self.posts = []
         self.t = 0
         self._next_post_id = 1
+        self.seed_post_ids = {}
         if self._topics:
             self.topic_manager = TopicManager(
                 self._topics,
                 self._hawkes_params,
+                self._initial_topic_heats,
                 base_curve=self.real_heat_trajectory,
-                base_weight=0.75,
+                base_weight=self.base_weight,
             )
+        bg_intensity = max(0, int(self.data_scale * self.bg_intensity_ratio))
+        bg_intensity = max(10, bg_intensity) if self.bg_intensity_ratio > 0 else 0
+        self.bg_generator = BackgroundTrafficGenerator(peak_time=10, intensity=bg_intensity)
+        self._inject_seed_posts()
         self._agent_last_action = {name: 0 for name in self.agents}
         self._last_step_real_volume = 0.0
         self.M_fast = 0.0
@@ -358,9 +426,10 @@ class SocialEnv:
             "为啥网上的药比实体药店更便宜": "【健康消费】#为啥网上的药比实体药店更便宜# 有人说是补贴，有人说是渠道差异，你怎么看？",
             "太空发快递可以当日达了": "【科技速递】#太空发快递可以当日达了# 新一代太空物流方案公布，太空快递或将进入现实。",
         }
+        self.seed_post_ids = {}
         for topic in self._topics:
             content = seed_templates.get(topic, f"【热门话题】关于 #{topic}# 的最新讨论开启了。")
-            self._add_post(
+            post = self._add_post(
                 author="Official_Media_001",
                 text=content,
                 sentiment="NEUTRAL",
@@ -368,6 +437,8 @@ class SocialEnv:
                 topic=topic,
                 count=20.0,
             )
+            if post is not None:
+                self.seed_post_ids[topic] = post.id
 
     def _compute_reach(self, author: str) -> int:
         """简单地以关注入度作为传播影响力近似。"""
@@ -424,8 +495,7 @@ class SocialEnv:
         for tp, c in zip(self._topics, alloc):
             if c <= 0:
                 continue
-            # 使用空内容，仅作为强度事件，不进入 env.posts
-            self.topic_manager.add_post(tp, "", current_time=self.t, reach=0.0, count=float(c))
+            self.topic_manager.add_volume(tp, current_time=self.t, reach=0.0, count=float(c))
 
     def _compute_sentiment_score(self, posts: List[Post]) -> float:
         """
@@ -468,7 +538,7 @@ class SocialEnv:
         target_post_id: Optional[int] = None,
         topic: Optional[str] = None,
         count: float = 1.0,
-    ):
+    ) -> Optional[Post]:
         post = Post(
             id=self._next_post_id,
             author=author,
@@ -485,6 +555,61 @@ class SocialEnv:
         if self.topic_manager and topic:
             reach = self._compute_reach(author)
             self.topic_manager.add_post(topic, text, current_time=self.t, reach=reach, count=count)
+        return post
+
+    def _run_synthetic_batch(self, active_agents: List[Any], env_context: dict) -> Dict[str, dict]:
+        """
+        无 LLM 时的启发式策略，用于离线调参/回归测试：
+        - 根据 global_scale / emotion / confidence 产生 5 类动作
+        - topic 通过 Agent._suggest_topic（依赖 topic_heats/cold_topics）选择
+        - 互动类动作允许不填 target_post_id，交由 apply_batch_result 自动锁定
+        """
+        action_map: Dict[str, dict] = {}
+        global_scale = float((env_context or {}).get("global_scale", 0.0))
+        for ag in active_agents:
+            emotion = float(getattr(ag, "emotion", 0.5) or 0.5)
+            confidence = float(getattr(ag, "social_confidence", 0.5) or 0.5)
+            suggested_topic = ag._suggest_topic(env_context) if hasattr(ag, "_suggest_topic") else None
+
+            p_act = min(0.95, 0.10 + 0.60 * global_scale + 0.20 * abs(emotion - 0.5))
+            if random.random() > p_act:
+                action_map[ag.name] = {"agent_id": ag.name, "action": "silent", "suggested_topic": suggested_topic}
+                continue
+
+            # 动作选择：低信心偏 like/silent；高信心或强情绪偏 comment/retweet/post
+            if confidence < 0.35 and 0.35 <= emotion <= 0.65:
+                action = random.choices(["silent", "like"], weights=[0.4, 0.6], k=1)[0]
+            elif confidence > 0.75 and (emotion < 0.3 or emotion > 0.7):
+                action = random.choices(["comment", "retweet", "post"], weights=[0.45, 0.30, 0.25], k=1)[0]
+            elif emotion < 0.3 or emotion > 0.7:
+                action = random.choices(["like", "comment", "retweet"], weights=[0.35, 0.45, 0.20], k=1)[0]
+            else:
+                action = random.choices(["silent", "like", "comment"], weights=[0.35, 0.45, 0.20], k=1)[0]
+
+            # 轻量级情绪/信心更新
+            emotion_change = float(random.uniform(-0.05, 0.05) + (global_scale - 0.5) * 0.02)
+            confidence_change = float(random.uniform(-0.03, 0.04) + (0.5 - abs(emotion - 0.5)) * 0.01)
+
+            topic = suggested_topic if isinstance(suggested_topic, str) and suggested_topic.strip() else None
+            content = ""
+            if action == "post":
+                content = f"围绕#{topic or '热门话题'}# 的讨论：我觉得这事值得关注。"
+            elif action == "comment":
+                content = "补充一句：别急着下结论，先看信息源。"
+            elif action == "retweet":
+                content = "转发一下，让更多人看到。"
+
+            action_map[ag.name] = {
+                "agent_id": ag.name,
+                "thought": "synthetic_policy",
+                "emotion_change": max(-0.2, min(0.2, emotion_change)),
+                "confidence_change": max(-0.2, min(0.2, confidence_change)),
+                "action": action,
+                "content": content,
+                "topic": topic,
+                "suggested_topic": topic,
+            }
+        return action_map
 
     def _infer_data_scale(self, topics: Sequence[str]) -> float:
         """
@@ -514,7 +639,24 @@ class SocialEnv:
         last_posts = [p for p in recent_posts if p.time_step == self.t - 1]
         # 全量映射用于目标对齐，避免目标帖子超出最近窗口导致话题缺失
         all_posts_map = {p.id: p for p in self.posts}
-        observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in recent_posts[-10:]]
+        # 观察数据：前部放“种子贴”（用于锁定话题），尾部放最新动态（用于减少 prompt 体积）
+        seed_posts = []
+        for pid in (self.seed_post_ids or {}).values():
+            sp = all_posts_map.get(pid)
+            if sp is not None:
+                seed_posts.append(sp)
+        max_observed = 120
+        room_for_recent = max(0, max_observed - len(seed_posts))
+        observed_posts = seed_posts + recent_posts[-room_for_recent:]
+        # 去重，保持 seed 在前、最新在后
+        seen_ids = set()
+        deduped: List[Post] = []
+        for p in observed_posts:
+            if p.id in seen_ids:
+                continue
+            seen_ids.add(p.id)
+            deduped.append(p)
+        observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in deduped]
 
         # 2. hawkes target heat (inject background first)
         if self.topic_manager and self._topics:
@@ -541,36 +683,38 @@ class SocialEnv:
         env_fields.global_scale = norm_intensity
         self.phase = self._determine_phase(current_heat_raw)
 
-        # 5. async batch
-        async def _run_async_batch():
-            env_ctx_for_llm = {
-                "topic_heats": {k: round(v.get("heat", 0.0), 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
-                "cold_topics": sorted(
-                    self.topic_manager.topics.keys(),
-                    key=lambda k: self.topic_manager.topics[k].get("heat", 0.0),
-                )[: max(1, len(self._topics) // 5)] if self.topic_manager else [],
-                "phase": self.phase,
-                "global_tension": env_fields.risk,
-                "visibility": env_fields.visibility,
-                "global_scale": env_fields.global_scale,
-                "global_mood": round(avg_emotion, 2),
-                "topic_backgrounds": self.topic_backgrounds,
-            }
-            actions_future = self.batch_processor.run_batch(active_agents, env_ctx_for_llm, observed)
-            maint_tasks = [ag.check_memory_maintenance() for ag in active_agents]
-            results = await asyncio.gather(actions_future, *maint_tasks)
-            return results[0]
+        # 5. batch (LLM or synthetic)
+        env_ctx_for_llm = {
+            "topic_heats": {k: round(v.get("heat", 0.0), 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
+            "cold_topics": sorted(
+                self.topic_manager.topics.keys(),
+                key=lambda k: self.topic_manager.topics[k].get("heat", 0.0),
+            )[: max(1, len(self._topics) // 5)] if self.topic_manager else [],
+            "phase": self.phase,
+            "global_tension": env_fields.risk,
+            "visibility": env_fields.visibility,
+            "global_scale": env_fields.global_scale,
+            "global_mood": round(avg_emotion, 2),
+            "topic_backgrounds": self.topic_backgrounds,
+        }
 
-        try:
-            action_map = asyncio.run(_run_async_batch())
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-            action_map = loop.run_until_complete(_run_async_batch())
+        if self.batch_processor is None:
+            action_map = self._run_synthetic_batch(active_agents, env_ctx_for_llm)
+        else:
+            async def _run_async_batch():
+                actions_future = self.batch_processor.run_batch(active_agents, env_ctx_for_llm, observed)
+                maint_tasks = [ag.check_memory_maintenance() for ag in active_agents]
+                results = await asyncio.gather(actions_future, *maint_tasks)
+                return results[0]
+
+            try:
+                action_map = asyncio.run(_run_async_batch())
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+                action_map = loop.run_until_complete(_run_async_batch())
 
         # 6. process results and gate probabilities
         actions: List[AgentAction] = []
-        smart_agent_ratio = 0.5
-        base_volume = (self.population_scale * smart_agent_ratio) / max(len(active_agents), 1)
         for agent in active_agents:
             res = action_map.get(agent.name, {"action": "silent"})
             should_act = True
@@ -622,9 +766,17 @@ class SocialEnv:
                 else:
                     base_weight = 1.0
 
-                act_volume = base_volume * base_weight * random.uniform(0.8, 1.2)
+                target_topic = action_obj.topic
+                t_scale = self.topic_scales.get(target_topic, 0.0) or self.data_scale
+                # 安全锁：防止 scale 太小导致数值异常
+                t_scale = max(float(t_scale), 500.0)
+                dynamic_volume = t_scale * float(self.volume_factor)
+
+                role_weight = float(getattr(agent, "weight_ratio", 1.0) or 1.0)
                 if ("KOL" in action_obj.agent_id) or ("Official" in action_obj.agent_id) or (getattr(agent, "role", "") in ("KOL", "Official", "BrandOfficial")):
-                    act_volume *= 2.0
+                    role_weight *= 2.5
+
+                act_volume = dynamic_volume * base_weight * role_weight * random.uniform(0.8, 1.2)
                 self._add_post(
                     author=action_obj.agent_id,
                     text=action_obj.content,

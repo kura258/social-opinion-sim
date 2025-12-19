@@ -49,6 +49,11 @@ class BatchActionProcessor:
         try:
             response = await self.llm.chat_async(system_prompt, user_prompt, temperature=temp)
             parsed = self._parse_json(response, [ag.name for ag in agents])
+            # 补齐 suggested_topic，便于后续在 apply_batch_result 中强制对齐 Post 的 topic
+            suggested_map = {d.get("agent_id"): d.get("suggested_topic") for d in agents_data}
+            for aid, item in parsed.items():
+                if isinstance(item, dict) and aid in suggested_map and suggested_map[aid]:
+                    item.setdefault("suggested_topic", suggested_map[aid])
             if not agents:
                 return parsed
             if parsed:
@@ -127,6 +132,8 @@ class BatchActionProcessor:
             f"- 大部分普通用户 (Crowd) 更倾向于 Like 或 Silent。\n"
             f"- 只有 KOL 或情绪极端的 Troll 才频繁 Post/Retweet。\n"
             f"- 如果选择 Like/Comment/Retweet：必须从 observation_items 中选择一个 target_post_id，并让 topic 等于该目标帖的 topic。\n"
+            f"- 为减少话题串味：Like/Comment/Retweet 优先选择 target 的 topic == suggested_topic；只有确实找不到匹配目标时才跨话题互动。\n"
+            f"- 如果 observation_items 中没有合适的同话题目标：允许不填 target_post_id，我们会在后处理阶段自动为你挑选同话题目标。\n"
             f"- 如果选择 Post：topic 必须等于 suggested_topic，并且内容需贴合 topic_backgrounds[topic] 的描述，避免跑题。\n"
             f"- 若 cold_topics 非空，请优先补位这些话题（选择其中一个作为 suggested_topic 来发帖/参与讨论），以分散讨论。\n\n"
             f"{agents_json}\n\n"

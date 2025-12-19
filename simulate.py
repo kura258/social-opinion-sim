@@ -111,6 +111,10 @@ def simulate_steps(
     initial_topic_heats: Optional[dict] = None,
     real_heat_trajectory: Optional[dict] = None,
     population_scale: float = 5000.0,
+    use_llm: bool = True,
+    base_weight: float = 0.75,
+    bg_intensity_ratio: float = 0.01,
+    volume_factor: float = 0.002,
 ):
     """
     运行多时间步模拟，返回环境、每步新增动作列表、Hawkes 热度快照与 LLM 涌现热度。
@@ -119,7 +123,7 @@ def simulate_steps(
     if not topics:
         topics = pick_default_topics(seed=seed, k=5)
 
-    llm = LLMClient()
+    llm = LLMClient() if use_llm else None
     agents = build_agents(llm, topics=topics)
     G = build_graph(agents.keys())
     env = SocialEnv(
@@ -132,6 +136,9 @@ def simulate_steps(
         initial_topic_heats=initial_topic_heats,
         real_heat_trajectory=real_heat_trajectory,
         population_scale=population_scale,
+        base_weight=base_weight,
+        bg_intensity_ratio=bg_intensity_ratio,
+        volume_factor=volume_factor,
     )
 
     steps = []
@@ -296,26 +303,35 @@ def run_and_compare(
     topics: Optional[List[str]] = None,
     hawkes_params: Optional[dict] = None,
     real_data_path: Optional[Path] = None,
+    use_llm: bool = False,
 ):
     """
     运行模拟并与最新训练数据对比，输出 MSE/MAPE 和对比图。
     """
     topics = topics or DEFAULT_TOPICS
     real_path = real_data_path or DEFAULT_REAL_DATA_PATH
+    real_series = _load_real_series(real_path, topics, max_steps=T)
+    initial_heats = {t: (real_series.get(t) or [0.0])[0] for t in topics}
+    heat_scale = max((max(v) for v in real_series.values() if v), default=1.0)
+    merged_params = dict(hawkes_params or BEST_HAWKES_PARAMS)
+    merged_params["heat_scale"] = float(heat_scale)
+
     env, steps, heat_history, emergent_heat_history = simulate_steps(
         T=T,
         seed=seed,
         topics=topics,
-        hawkes_params=hawkes_params or BEST_HAWKES_PARAMS,
+        hawkes_params=merged_params,
+        fixed_heat_scale=float(heat_scale),
+        initial_topic_heats=initial_heats,
+        real_heat_trajectory=real_series,
+        population_scale=float(heat_scale),
+        use_llm=use_llm,
     )
     # 收集模拟热度
     sim_series = {t: [] for t in topics}
     for snap in heat_history:
         for t in topics:
             sim_series[t].append(snap.get(t, 0.0))
-
-    # 读取真实热度
-    real_series = _load_real_series(real_path, topics, max_steps=len(heat_history))
 
     initial_overall, initial_per_topic = _compute_metrics(sim_series, real_series)
 

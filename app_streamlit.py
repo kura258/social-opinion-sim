@@ -129,21 +129,47 @@ def compute_metrics(pred_df: pd.DataFrame, real_df: pd.DataFrame, topic_max: pd.
     merged = pred_df.merge(real_df, on=["time", "topic"], how="inner")
     if merged.empty:
         return None, None, None
+    epsilon = 1e-6
+    # 如果做了按 topic 峰值归一化，MAPE 的分母会变得很小（长尾/早期容易“误差爆炸”）
+    # 因此采用“过滤版 MAPE”：仅在 heat_real 大于阈值时计入
+    mape_threshold = 0.01 if topic_max is not None else 10.0
     if topic_max is not None:
         merged = merged.join(topic_max.rename("heat_max"), on="topic")
-        merged["heat_max"] = merged["heat_max"].replace(0, 1e-6)
+        merged["heat_max"] = merged["heat_max"].replace(0, epsilon)
         merged["heat_real"] = merged["heat_real"] / merged["heat_max"]
         merged["heat_pred"] = merged["heat_pred"] / merged["heat_max"]
 
     merged["mse"] = (merged["heat_pred"] - merged["heat_real"]) ** 2
-    merged["ape"] = (merged["heat_pred"] - merged["heat_real"]).abs() / (merged["heat_real"].abs() + 1e-6)
+    abs_err = (merged["heat_pred"] - merged["heat_real"]).abs()
+    denom = merged["heat_real"].abs() + epsilon
+    merged["ape"] = abs_err / denom
+    merged["mask"] = merged["heat_real"].abs() > float(mape_threshold)
     overall_mse = float(merged["mse"].mean())
-    overall_mape = float(merged["ape"].mean() * 100)
-    per_topic = merged.groupby("topic").agg(
-        mape=("ape", lambda x: float(x.mean() * 100)),
-        mse=("mse", "mean"),
-    ).reset_index()
-    return overall_mse, overall_mape, per_topic
+    if merged["mask"].any():
+        overall_mape = float(merged.loc[merged["mask"], "ape"].mean() * 100)
+        overall_wmape = float(abs_err[merged["mask"]].sum() / (merged.loc[merged["mask"], "heat_real"].abs().sum() + epsilon) * 100)
+    else:
+        overall_mape = float(merged["ape"].mean() * 100)
+        overall_wmape = float(abs_err.sum() / (merged["heat_real"].abs().sum() + epsilon) * 100)
+
+    def _mape_filtered(group: pd.DataFrame) -> float:
+        m = group["mask"]
+        if m.any():
+            return float(group.loc[m, "ape"].mean() * 100)
+        return float(group["ape"].mean() * 100)
+
+    def _wmape(group: pd.DataFrame) -> float:
+        m = group["mask"]
+        if m.any():
+            return float(group.loc[m, "ape"].mul(group.loc[m, "heat_real"].abs()).sum() / (group.loc[m, "heat_real"].abs().sum() + epsilon) * 100)
+        return float(group["ape"].mul(group["heat_real"].abs()).sum() / (group["heat_real"].abs().sum() + epsilon) * 100)
+
+    per_topic = (
+        merged.groupby("topic")
+        .apply(lambda g: pd.Series({"mape": _mape_filtered(g), "wmape": _wmape(g), "mse": float(g["mse"].mean())}))
+        .reset_index()
+    )
+    return overall_mse, overall_mape, overall_wmape, per_topic
 
 
 def plot_metrics(per_topic: pd.DataFrame):
@@ -180,6 +206,10 @@ def main():
     base_seed = st.sidebar.number_input("随机种子", min_value=0, max_value=9999, value=DEFAULT_SIM_SEED)
     delay_sec = st.sidebar.slider("每步界面延迟（秒）", 0.0, 2.0, 0.2, 0.05)
     request_delay = st.sidebar.slider("API 请求间隔（秒）", 0.0, 2.0, 0.2, 0.05)
+    st.sidebar.subheader("动力学参数（拟合用）")
+    base_weight = st.sidebar.slider("真实曲线引导权重 (base_weight)", 0.0, 1.0, 0.75, 0.05)
+    bg_intensity_ratio = st.sidebar.slider("背景流量比例 (bg_intensity_ratio)", 0.0, 0.05, 0.01, 0.001)
+    volume_factor = st.sidebar.slider("Agent 声量系数 (volume_factor)", 0.0, 0.02, 0.002, 0.0005)
 
     # 默认话题：使用数据集的全部 35 个，可在前端修改
     default_topics = pick_default_topics(seed=base_seed)
@@ -263,6 +293,9 @@ def main():
             initial_topic_heats=initial_heats,
             real_heat_trajectory=real_heat_trajectory,
             population_scale=real_heat_scale,
+            base_weight=float(base_weight),
+            bg_intensity_ratio=float(bg_intensity_ratio),
+            volume_factor=float(volume_factor),
         )
         st.success("模拟完成")
 
@@ -326,12 +359,13 @@ def main():
             else:
                 topic_max = norm_real.groupby("topic")["heat_real"].max()
                 pred_df = compute_pred_df(heat_history)
-                overall_mse, overall_mape, per_topic = compute_metrics(pred_df, norm_real, topic_max=topic_max)
+                overall_mse, overall_mape, overall_wmape, per_topic = compute_metrics(pred_df, norm_real, topic_max=topic_max)
                 st.subheader("真实数据对比 (MAPE / MSE)")
                 if overall_mse is None:
                     st.info("无法对齐真实数据，请确认 time/topic 匹配。")
                 else:
                     st.write(f"总体 MAPE: {overall_mape:.3f}%")
+                    st.write(f"总体 WMAPE: {overall_wmape:.3f}%")
                     st.write(f"总体 MSE: {overall_mse:.6f}")
                     st.dataframe(per_topic)
                     fig = plot_metrics(per_topic)

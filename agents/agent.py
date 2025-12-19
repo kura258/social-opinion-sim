@@ -80,6 +80,7 @@ class Agent:
         content = action_result.get("content", "") or ""
         topic = action_result.get("topic")
         original_topic = topic
+        suggested_topic = action_result.get("suggested_topic")
 
         final_action_type = "silent"
         target_post_id = None
@@ -88,7 +89,11 @@ class Agent:
             if observed_posts:
                 target_post_id = action_result.get("target_post_id") or action_result.get("target_postId")
                 target_hint = action_result.get("target_user", "") or ""
-                preferred_topic = topic if topic else (self.topics[0] if self.topics else None)
+                preferred_topic = (
+                    topic
+                    if topic
+                    else (suggested_topic if isinstance(suggested_topic, str) and suggested_topic.strip() else None)
+                ) or (self.topics[0] if self.topics else None)
 
                 target = None
                 if target_post_id is not None:
@@ -137,9 +142,8 @@ class Agent:
 
         # 强制 Post 使用 suggested_topic，避免 topic/text 失配（LLM 未给 topic 时也能锁定）
         if final_action_type == "post":
-            suggested = action_result.get("suggested_topic")
-            if isinstance(suggested, str) and suggested.strip():
-                topic = suggested.strip()
+            if isinstance(suggested_topic, str) and suggested_topic.strip():
+                topic = suggested_topic.strip()
 
         if final_action_type != "silent":
             if (not topic) or (isinstance(topic, str) and topic.strip().lower() in ("null", "none", "")):

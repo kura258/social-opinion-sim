@@ -408,8 +408,10 @@ class SocialEnv:
         bg_count = self.bg_generator.get_noise_volume(self.t)
 
         # 1. data prep
-        recent_posts = self.posts[-50:]
-        last_posts_map = {p.id: p for p in recent_posts}
+        recent_posts = self.posts[-200:]
+        last_posts = [p for p in recent_posts if p.time_step == self.t - 1]
+        # 全量映射用于目标对齐，避免目标帖子超出最近窗口导致话题缺失
+        all_posts_map = {p.id: p for p in self.posts}
         observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in recent_posts[-10:]]
 
         # 2. hawkes target heat (inject background first)
@@ -477,18 +479,18 @@ class SocialEnv:
             final_act = agent.apply_batch_result(res, self.t, observed_posts=observed)
 
             target_pid = final_act.get("target_post_id")
-            if target_pid in last_posts_map:
-                target_topic = last_posts_map[target_pid].topic or "未标注"
+            if target_pid in all_posts_map:
+                target_topic = all_posts_map[target_pid].topic or "未标注"
                 # 对互动类动作强制使用目标帖子的 topic，避免跨话题串线
                 if final_act.get("action_type") in ("like", "comment", "retweet"):
                     final_act["topic"] = target_topic
             elif final_act.get("action_type") in ("like", "comment", "retweet"):
-                if final_act.get("action_type") == "retweet":
-                    final_act["action_type"] = "post"
-                else:
-                    final_act["action_type"] = "silent"
+                final_act["action_type"] = "silent"
             if not final_act.get("topic"):
-                final_act["topic"] = self._topics[0] if self._topics else "未标注"
+                if self._topics:
+                    final_act["topic"] = random.choice(self._topics)
+                else:
+                    final_act["topic"] = "未标注"
             if final_act.get("action_type") in ("post", "retweet", "comment", "like"):
                 action_obj = AgentAction(
                     agent_id=agent.name,

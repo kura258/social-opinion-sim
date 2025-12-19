@@ -198,10 +198,22 @@ def _compute_metrics(sim_series: Dict[str, List[float]], real_series: Dict[str, 
     返回 overall 与 per-topic 结果。
     """
     def mse(a, b):
-        return sum((x - y) ** 2 for x, y in zip(a, b)) / max(len(a), 1)
+        return float(np.mean((np.array(a) - np.array(b)) ** 2)) if a and b else 0.0
 
-    def mape(a, b):
-        return sum(abs(x - y) / max(abs(y), 1e-6) for x, y in zip(a, b)) / max(len(a), 1) * 100.0
+    def mape_filtered(a, b, threshold: float = 10.0, epsilon: float = 1e-6):
+        if not a or not b:
+            return 0.0
+        y_true = np.array(b)
+        y_pred = np.array(a)
+        L = min(len(y_true), len(y_pred))
+        if L == 0:
+            return 0.0
+        y_true = y_true[:L]
+        y_pred = y_pred[:L]
+        mask = y_true > threshold
+        if mask.sum() == 0:
+            return 0.0
+        return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / (y_true[mask] + epsilon))) * 100.0)
 
     per_topic = {}
     mse_total = 0.0
@@ -215,7 +227,7 @@ def _compute_metrics(sim_series: Dict[str, List[float]], real_series: Dict[str, 
         sim_cut = sim[:L]
         real_cut = real[:L]
         m = mse(sim_cut, real_cut)
-        p = mape(sim_cut, real_cut)
+        p = mape_filtered(sim_cut, real_cut)
         per_topic[t] = {"mse": m, "mape": p, "len": L}
         mse_total += m
         mape_total += p

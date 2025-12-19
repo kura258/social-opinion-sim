@@ -73,6 +73,7 @@ class Agent:
         raw_action = (action_result.get("action", "silent") or "silent").lower()
         content = action_result.get("content", "") or ""
         topic = action_result.get("topic")
+        original_topic = topic
 
         final_action_type = "silent"
         target_post_id = None
@@ -99,10 +100,7 @@ class Agent:
                 topic = target.get("topic", topic)
                 final_action_type = raw_action
             else:
-                if raw_action == "retweet":
-                    final_action_type = "post"
-                else:
-                    final_action_type = "silent"
+                final_action_type = "silent"
         elif raw_action == "post":
             final_action_type = "post"
         else:
@@ -119,7 +117,7 @@ class Agent:
 
         if final_action_type != "silent":
             if (not topic) or (isinstance(topic, str) and topic.strip().lower() in ("null", "none", "")):
-                topic = random.choice(self.topics) if self.topics else "未标注"
+                topic = original_topic or (random.choice(self.topics) if self.topics else "未标注")
 
             self.memory.add(f"在 t={time_step} {final_action_type}: {content}")
             self.last_act_time = time_step

@@ -54,10 +54,11 @@ class EnvFields:
 @dataclass
 class AgentAction:
     agent_id: str
-    action_type: str  # "post", "retweet", "silent"
+    action_type: str  # "post", "retweet", "comment", "like", "silent"
     content: str
     topic: str
     timestamp: int
+    target_post_id: Optional[int] = None
 
 
 class FieldGenerator:
@@ -407,7 +408,8 @@ class SocialEnv:
 
         # 1. data prep
         last_posts = [p for p in self.posts if p.time_step == self.t - 1]
-        observed = [{"author": p.author, "text": p.text} for p in last_posts[-10:]]
+        last_posts_map = {p.id: p for p in last_posts}
+        observed = [{"id": p.id, "author": p.author, "text": p.text, "topic": p.topic} for p in last_posts[-10:]]
 
         # 2. hawkes target heat (inject background first)
         self._update_hawkes_no_topic(bg_count)
@@ -470,17 +472,38 @@ class SocialEnv:
             if not should_act:
                 res["action"] = "silent"
 
-            final_act = agent.apply_batch_result(res, self.t)
-            if final_act.get("action_type") in ("post", "retweet"):
+            final_act = agent.apply_batch_result(res, self.t, observed_posts=observed)
+
+            target_pid = final_act.get("target_post_id")
+            if target_pid in last_posts_map:
+                target_topic = last_posts_map[target_pid].topic or "未标注"
+                # 对互动类动作强制使用目标帖子的 topic，避免跨话题串线
+                if final_act.get("action_type") in ("like", "comment", "retweet"):
+                    final_act["topic"] = target_topic
+            if not final_act.get("topic"):
+                final_act["topic"] = self._topics[0] if self._topics else "未标注"
+            if final_act.get("action_type") in ("post", "retweet", "comment", "like"):
                 action_obj = AgentAction(
                     agent_id=agent.name,
                     action_type=final_act["action_type"],
                     content=final_act.get("content", ""),
                     topic=final_act.get("topic"),
                     timestamp=self.t,
+                    target_post_id=final_act.get("target_post_id"),
                 )
                 actions.append(action_obj)
-                act_volume = base_volume * random.uniform(0.5, 1.5)
+
+                act_type = final_act["action_type"]
+                if act_type == "like":
+                    base_weight = 0.1
+                elif act_type == "comment":
+                    base_weight = 0.5
+                elif act_type == "retweet":
+                    base_weight = 1.2
+                else:
+                    base_weight = 1.0
+
+                act_volume = base_volume * base_weight * random.uniform(0.8, 1.2)
                 if ("KOL" in action_obj.agent_id) or ("Official" in action_obj.agent_id) or (getattr(agent, "role", "") in ("KOL", "Official", "BrandOfficial")):
                     act_volume *= 2.0
                 self._add_post(
@@ -490,5 +513,6 @@ class SocialEnv:
                     tag="user",
                     topic=action_obj.topic,
                     count=act_volume,
+                    target_post_id=final_act.get("target_post_id"),
                 )
         return actions

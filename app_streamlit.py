@@ -90,6 +90,41 @@ def normalize_real_df(raw_df: pd.DataFrame, topics: List[str]) -> Optional[pd.Da
     return df[["time", "topic", "heat_real"]]
 
 
+def build_topic_feed(steps: List[List], env: SocialEnv, heat_history: List[dict]):
+    """
+    构造话题热榜及互动流水：按 topic 归类每步的动作，并给出排序分值。
+    """
+    feed: Dict[str, Dict[str, List[dict]]] = {}
+    post_lookup = {p.id: p for p in env.posts}
+    for t_idx, acts in enumerate(steps, start=1):
+        for act in acts:
+            topic = getattr(act, "topic", None)
+            if not topic:
+                continue
+            entry = {
+                "time": t_idx,
+                "agent": getattr(act, "agent_id", ""),
+                "action": getattr(act, "action_type", ""),
+                "content": getattr(act, "content", ""),
+                "target": "",
+            }
+            target_post_id = getattr(act, "target_post_id", None)
+            if target_post_id and target_post_id in post_lookup:
+                tp = post_lookup[target_post_id]
+                entry["target"] = f"@{tp.author}: {tp.text[:40]}..."
+            feed.setdefault(topic, {}).setdefault(entry["action"], []).append(entry)
+
+    if heat_history:
+        last = dict(heat_history[-1])
+        last.pop("time", None)
+        ranking = sorted(last.items(), key=lambda kv: kv[1], reverse=True)
+    else:
+        ranking = sorted(((tp, sum(len(v) for v in acts.values())) for tp, acts in feed.items()), key=lambda kv: kv[1], reverse=True)
+
+    ordered_topics = [tp for tp, _ in ranking]
+    return feed, ranking, ordered_topics
+
+
 def compute_metrics(pred_df: pd.DataFrame, real_df: pd.DataFrame, topic_max: pd.Series | None = None):
     merged = pred_df.merge(real_df, on=["time", "topic"], how="inner")
     if merged.empty:
@@ -171,7 +206,6 @@ def main():
     real_heat_scale = 1.0
     initial_heats: Dict[str, float] = {}
     real_heat_trajectory: Dict[str, List[float]] = {}
-    population_scale_input = st.sidebar.number_input("人口规模系数", min_value=0.0, value=10000.0, step=1000.0)
 
     if st.button("开始模拟"):
         st.info("正在创建环境并运行，请稍候...")
@@ -220,11 +254,6 @@ def main():
         else:
             real_heat_scale = 100.0
 
-        final_pop_scale = population_scale_input
-        if population_scale_input == 10000.0 and real_heat_scale > 20000:
-            st.warning(f"检测到默认人口系数(1w)与真实量级({real_heat_scale:,.0f})差距过大，已自动对齐。")
-            final_pop_scale = real_heat_scale
-
         env, steps, heat_history, emergent_heat_history = simulate_steps(
             T=T,
             seed=base_seed,
@@ -234,9 +263,33 @@ def main():
             fixed_heat_scale=real_heat_scale,
             initial_topic_heats=initial_heats,
             real_heat_trajectory=real_heat_trajectory,
-            population_scale=final_pop_scale,
+            population_scale=real_heat_scale,
         )
         st.success("模拟完成")
+
+        topic_feed, topic_ranking, ordered_topics = build_topic_feed(steps, env, heat_history)
+        st.subheader("话题热榜 & 互动流")
+        if topic_ranking:
+            for idx, (tp, score) in enumerate(topic_ranking, start=1):
+                score_val = float(score) if isinstance(score, (int, float)) else score
+                st.markdown(f"**{idx}. {tp}** · 热度/计数：{score_val:.2f}" if isinstance(score_val, float) else f"**{idx}. {tp}** · 热度/计数：{score_val}")
+                actions_by_type = topic_feed.get(tp, {})
+                summary_counts = {k: len(v) for k, v in actions_by_type.items()}
+                st.markdown(f"点赞: {summary_counts.get('like',0)}｜评论: {summary_counts.get('comment',0)}｜转发: {summary_counts.get('retweet',0)}｜发帖: {summary_counts.get('post',0)}")
+
+                for label, key in [("发帖", "post"), ("转发", "retweet"), ("评论", "comment"), ("点赞", "like")]:
+                    items = actions_by_type.get(key, [])
+                    if not items:
+                        continue
+                    with st.expander(f"{label}（{len(items)}）", expanded=False):
+                        for item in items:
+                            target_txt = f" ↪ {item['target']}" if item.get("target") else ""
+                            content_txt = item.get("content", "")
+                            st.markdown(
+                                f"- t={item['time']:>3}｜{item['agent']} {item['action']}：{content_txt}{target_txt}"
+                            )
+        else:
+            st.info("暂无互动记录。")
 
         # 话题热度折线图
         if heat_history:

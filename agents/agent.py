@@ -47,7 +47,12 @@ class Agent:
             "current_state": {"emotion": self.emotion, "confidence": self.social_confidence},
         }
 
-    def apply_batch_result(self, action_result: dict, time_step: int) -> Dict[str, Any]:
+    def apply_batch_result(
+        self,
+        action_result: dict,
+        time_step: int,
+        observed_posts: Optional[List[dict]] = None,
+    ) -> Dict[str, Any]:
         if action_result is None:
             action_result = {}
 
@@ -65,29 +70,53 @@ class Agent:
             except (TypeError, ValueError):
                 pass
 
-        action_type = (action_result.get("action", "silent") or "silent").lower()
+        raw_action = (action_result.get("action", "silent") or "silent").lower()
         content = action_result.get("content", "") or ""
         topic = action_result.get("topic")
 
-        if action_type in ["post", "retweet"] and not content.strip():
-            action_type = "silent"
+        final_action_type = "silent"
+        target_post_id = None
 
-        if action_type != "silent":
+        if raw_action in ["like", "comment", "retweet"]:
+            if observed_posts:
+                target_hint = action_result.get("target_user", "") or ""
+                candidates = [p for p in observed_posts if target_hint and target_hint in str(p.get("author", ""))]
+                target = random.choice(candidates) if candidates else random.choice(observed_posts)
+                target_post_id = target.get("id")
+                final_action_type = raw_action
+            else:
+                if raw_action == "retweet":
+                    final_action_type = "post"
+                else:
+                    final_action_type = "silent"
+        elif raw_action == "post":
+            final_action_type = "post"
+        else:
+            final_action_type = "silent"
+
+        if final_action_type in ["post", "retweet", "comment"] and not content.strip():
+            final_action_type = "silent"
+            content = ""
+
+        if final_action_type == "like":
+            content = "[Like]"
+        elif final_action_type == "silent":
+            content = ""
+
+        if final_action_type != "silent":
             if (not topic) or (isinstance(topic, str) and topic.strip().lower() in ("null", "none", "")):
                 topic = random.choice(self.topics) if self.topics else "未标注"
-            elif self.topics and topic not in self.topics:
-                topic = random.choice(self.topics)
 
-            self.memory.add(f"在 t={time_step} {action_type}: {content}")
+            self.memory.add(f"在 t={time_step} {final_action_type}: {content}")
             self.last_act_time = time_step
 
         return {
             "agent_id": self.name,
-            "action_type": action_type,
+            "action_type": final_action_type,
             "content": content,
             "sentiment": action_result.get("sentiment", "NEUTRAL"),
             "topic": topic if topic else (self.topics[0] if self.topics else "未标注"),
-            "target_post_id": action_result.get("target_post_id"),
+            "target_post_id": target_post_id,
         }
 
     def _summarize_observation(self, posts: List[dict]) -> str:

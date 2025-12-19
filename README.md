@@ -1,7 +1,7 @@
 # 多智能体舆论模拟（Hawkes + LLM / Synthetic Policy）
 本项目用于模拟多话题舆论热度随时间的演化：后端采用双衰减核 Hawkes 过程（每话题独立记忆项），前端用 Streamlit 做热榜/互动流展示，并支持与真实热度曲线对比（MAPE / WMAPE / MSE）。
 
-核心目标：在“严格话题隔离”的前提下，让模拟曲线在小事件/大事件的量级上都能拟合稳定（避免 MAPE 爆炸）。
+核心目标：在“严格话题隔离”的前提下，让模拟曲线在不同热度量级的小事件/大事件上都能保持拟合稳定。
 
 ---
 
@@ -14,7 +14,7 @@
 - **两种运行模式**：
   - `LLM 模式`：需要 `CLOSEAI_API_KEY`，产出更像社交媒体的内容与互动。
   - `Synthetic 模式`：不依赖 LLM，用启发式策略生成动作，适合离线调参/回归验证（可重复）。
-- **拟合指标更稳**：前端对比指标采用过滤版 MAPE（避免分母极小导致爆炸）并额外给出 WMAPE。
+- **拟合指标更稳**：前端对比指标采用过滤版 MAPE（过滤掉极小分母点）并额外给出 WMAPE。
 
 ---
 
@@ -126,7 +126,7 @@ python scripts\\tune_params.py --steps 350 --rounds 3
 
 ---
 
-## 指标口径（避免 MAPE 爆炸）
+## 指标口径
 前端会显示：
 - `MAPE`：过滤版 MAPE（真实值过小的点不计入）
 - `WMAPE`：加权 MAPE（用真实值做权重，更适合“大事件”）
@@ -147,6 +147,6 @@ python scripts\\tune_params.py --steps 350 --rounds 3
 ---
 
 ## 常见问题（Troubleshooting）
-- **MAPE 特别大（如 300）**：优先确认是否做了 `heat_scale` 对齐（Streamlit 会自动推断；`simulate.py: run_and_compare` 也会自动注入真实轨迹与 scale）。其次看是否使用了过滤版 MAPE/WMAPE（旧版 APE 对小值很敏感）。
-- **话题仍然串味**：检查 LLM 输出是否给了 `target_post_id`；即使不给也应通过种子贴兜底到同话题目标（`env/social_env.py` 的 observed 中包含种子贴）。
-- **没有 API Key 也想跑**：用 `python simulate.py` 或 `python scripts\\tune_params.py ...`（Synthetic 模式不需要 Key）。
+- **误差偏大**：确认真实数据 CSV 的 `topic/heat/(timestamp|time)` 列是否正确；并确保 `heat_scale` 已对齐（Streamlit 会自动推断，离线对比也会从真实曲线推断）。
+- **话题不够“隔离”**：互动类动作需要指向明确目标帖；项目会优先引导同话题互动并在后处理中强制继承目标 topic。
+- **没有 API Key 也想运行**：使用 `python simulate.py` 或 `python scripts\\tune_params.py ...`（Synthetic 模式不需要 Key）。

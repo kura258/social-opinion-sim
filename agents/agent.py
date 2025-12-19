@@ -14,6 +14,8 @@ class Agent:
         self.memory = Memory(name)
         self.last_act_time = 0
         self.weight_ratio = 1.0
+        self.emotion = 0.5
+        self.social_confidence = 0.5
 
     def _suggest_topic(self, env_context: dict) -> str:
         if not self.topics:
@@ -42,9 +44,27 @@ class Agent:
             "observation": obs_summary,
             "candidate_topics": list(self.topics),
             "suggested_topic": suggested_topic,
+            "current_state": {"emotion": self.emotion, "confidence": self.social_confidence},
         }
 
     def apply_batch_result(self, action_result: dict, time_step: int) -> Dict[str, Any]:
+        if action_result is None:
+            action_result = {}
+
+        emotion_change = action_result.get("emotion_change")
+        if emotion_change is not None:
+            try:
+                self.emotion = max(0.0, min(1.0, self.emotion + float(emotion_change)))
+            except (TypeError, ValueError):
+                pass
+
+        confidence_change = action_result.get("confidence_change")
+        if confidence_change is not None:
+            try:
+                self.social_confidence = max(0.0, min(1.0, self.social_confidence + float(confidence_change)))
+            except (TypeError, ValueError):
+                pass
+
         action_type = (action_result.get("action", "silent") or "silent").lower()
         content = action_result.get("content", "") or ""
         topic = action_result.get("topic")

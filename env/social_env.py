@@ -4,7 +4,6 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 import math
-import time
 import random
 
 import networkx as nx
@@ -14,6 +13,7 @@ import pandas as pd
 from config.settings import DEFAULT_REAL_DATA_PATH, load_hawkes_params
 from config.personas import PERSONAS
 from utils.topic_helper import generate_topic_background
+from utils.traffic_generator import BackgroundTrafficGenerator
 from agents.batch_processor import BatchActionProcessor
 
 
@@ -265,7 +265,7 @@ class SocialEnv:
         self._agent_last_action: Dict[str, int] = {name: 0 for name in agents}
         # 记录上一轮真实总量（未归一化）
         self._last_step_real_volume: float = 0.0
-        hp = hawkes_params or {}
+        hp = params
         self.params = {
             "mu_fast": hp.get("mu_fast", 0.5),
             "mu_slow": hp.get("mu_slow", 0.2),
@@ -281,6 +281,7 @@ class SocialEnv:
         self.field_generator = FieldGenerator(heat_scale=params.get("heat_scale", 100.0))
         self.batch_processor = BatchActionProcessor(self.llm_client)
         self.population_scale = float(population_scale or 1.0)
+        self.bg_generator = BackgroundTrafficGenerator(peak_time=10, intensity=300)
 
     def reset(self):
         self.posts = []
@@ -396,36 +397,41 @@ class SocialEnv:
         except Exception:
             return 1.0
 
+
     def step(self, pr_strategy=None, request_delay: float = 0.0) -> List[AgentAction]:
         """
         Expected-matching batch mode: compute global_scale from Hawkes intensity, then run batch LLM and probabilistic gate.
         """
         self.t += 1
+        bg_count = self.bg_generator.get_noise_volume(self.t)
 
-        # 1. 准备数据
+        # 1. data prep
         last_posts = [p for p in self.posts if p.time_step == self.t - 1]
         observed = [{"author": p.author, "text": p.text} for p in last_posts[-10:]]
 
-        # 2. 获取 Hawkes 目标热度
+        # 2. hawkes target heat (inject background first)
+        self._update_hawkes_no_topic(bg_count)
         if self.topic_manager and self._topics:
             current_heat_raw = sum(self.topic_manager.get_heat(tp, self.t) for tp in self._topics)
         else:
             current_heat_raw = self.current_intensity
 
         sentiment_score = self._compute_sentiment_score(last_posts)
+        avg_emotion = (
+            float(np.mean([getattr(a, "emotion", 0.0) for a in self.agents.values()]))
+            if self.agents
+            else 0.0
+        )
 
-        # 3. 计算总意愿（简化为人数）
-        env_fields_pre = self.field_generator.compute_fields(current_heat_raw, sentiment_score)
+        # 3. compute propensities
         active_agents = list(self.agents.values())
-        total_raw_propensity = float(len(active_agents)) if active_agents else 0.0
-
-        # 4. 动态缩放因子：只放不缩（不做上限截断），门控时再将概率截断到 1.0
+        # 4. dynamic scaling (no hard cap; gate later)
         norm_intensity = max(current_heat_raw / max(self.data_scale, 1.0), 0.0)
         env_fields = self.field_generator.compute_fields(current_heat_raw, sentiment_score)
         env_fields.global_scale = norm_intensity
         self.phase = self._determine_phase(current_heat_raw)
 
-        # 5. 异步批处理
+        # 5. async batch
         async def _run_async_batch():
             env_ctx_for_llm = {
                 "topic_heats": {k: round(v.get("heat", 0.0), 1) for k, v in self.topic_manager.topics.items()} if self.topic_manager else {},
@@ -433,6 +439,7 @@ class SocialEnv:
                 "global_tension": env_fields.risk,
                 "visibility": env_fields.visibility,
                 "global_scale": env_fields.global_scale,
+                "global_mood": round(avg_emotion, 2),
             }
             actions_future = self.batch_processor.run_batch(active_agents, env_ctx_for_llm, observed)
             maint_tasks = [ag.check_memory_maintenance() for ag in active_agents]
@@ -445,7 +452,7 @@ class SocialEnv:
             loop = asyncio.get_event_loop()
             action_map = loop.run_until_complete(_run_async_batch())
 
-        # 6. 处理结果并概率门控
+        # 6. process results and gate probabilities
         actions: List[AgentAction] = []
         base_volume = self.population_scale / max(len(active_agents), 1)
         for agent in active_agents:
